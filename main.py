@@ -1,130 +1,141 @@
 import os
-import random
+import asyncio
 import logging
-import psycopg2
 import pandas as pd
+import psycopg2
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Thiết lập logging
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Đọc biến môi trường
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# Kết nối PostgreSQL
-def get_db_connection():
+# Kết nối DB
+def init_db():
     conn = psycopg2.connect(DATABASE_URL)
-    return conn
-
-def create_table():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sicbo_results (
-            id SERIAL PRIMARY KEY,
-            result TEXT,
-            prediction TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ''')
-    conn.commit()
-    cursor.close()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id SERIAL PRIMARY KEY,
+                input TEXT NOT NULL,
+                tai_xiu TEXT,
+                chan_le TEXT,
+                is_bao BOOLEAN,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
     conn.close()
 
-create_table()
+# Lưu lịch sử
+def save_history(inp, tai_xiu, chan_le, is_bao):
+    conn = psycopg2.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO history (input, tai_xiu, chan_le, is_bao)
+            VALUES (%s, %s, %s, %s)
+        """, (inp, tai_xiu, chan_le, is_bao))
+        conn.commit()
+    conn.close()
 
-# Lưu kết quả thực tế và dự đoán
-def save_result(actual: str, prediction: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO sicbo_results (result, prediction) VALUES (%s, %s)",
-        (actual, prediction)
+# Lấy dữ liệu gần nhất để train
+def load_history(n=20):
+    conn = psycopg2.connect(DATABASE_URL)
+    df = pd.read_sql_query(f"""
+        SELECT * FROM history ORDER BY created_at DESC LIMIT {n}
+    """, conn)
+    conn.close()
+    return df[::-1]  # đảo ngược để đúng thứ tự thời gian
+
+# Tách đặc trưng từ chuỗi số
+def extract_features(text):
+    nums = [int(x) for x in text if x.isdigit()]
+    if len(nums) != 3:
+        raise ValueError("Vui lòng nhập đúng 3 số (vd: 123 hoặc 1 2 3)")
+    total = sum(nums)
+    features = {
+        "total": total,
+        "max": max(nums),
+        "min": min(nums),
+        "unique": len(set(nums)),
+        "same": 1 if len(set(nums)) == 1 else 0
+    }
+    return features
+
+# Dự đoán từ mô hình
+def predict_sicbo(input_text):
+    df = load_history(100)
+    if len(df) < 10:
+        return "Chưa đủ dữ liệu để dự đoán. Vui lòng nhập thêm kết quả thực tế."
+
+    X = pd.DataFrame([extract_features(x) for x in df["input"]])
+    y_tai_xiu = df["tai_xiu"]
+    y_chan_le = df["chan_le"]
+
+    le_tx = LabelEncoder().fit(y_tai_xiu)
+    le_cl = LabelEncoder().fit(y_chan_le)
+
+    X_train, X_test, y_tx_train, y_tx_test = train_test_split(X, le_tx.transform(y_tai_xiu), test_size=0.2, random_state=42)
+    _, _, y_cl_train, y_cl_test = train_test_split(X, le_cl.transform(y_chan_le), test_size=0.2, random_state=42)
+
+    rf = RandomForestClassifier().fit(X_train, y_tx_train)
+    xgb = XGBClassifier().fit(X_train, y_tx_train)
+    mlp = MLPClassifier(max_iter=500).fit(X_train, y_tx_train)
+
+    input_feat = pd.DataFrame([extract_features(input_text)])
+
+    # Tài/Xỉu prediction
+    preds = [rf.predict(input_feat)[0], xgb.predict(input_feat)[0], mlp.predict(input_feat)[0]]
+    vote_tx = max(set(preds), key=preds.count)
+    tai_xiu = le_tx.inverse_transform([vote_tx])[0]
+
+    # Chẵn/Lẻ prediction
+    rf2 = RandomForestClassifier().fit(X_train, y_cl_train)
+    chan_le = le_cl.inverse_transform(rf2.predict(input_feat))[0]
+
+    total = extract_features(input_text)["total"]
+    is_bao = extract_features(input_text)["same"] == 1
+
+    # Lưu lịch sử
+    save_history(input_text, tai_xiu, chan_le, is_bao)
+
+    return (
+        f"🎲 Kết quả dự đoán:\n"
+        f"• Tài/Xỉu: {tai_xiu}\n"
+        f"• Chẵn/Lẻ: {chan_le}\n"
+        f"• Tổng điểm: {total}\n"
+        f"{'⚠️ CẢNH BÁO: BÃO (3 số giống nhau)' if is_bao else ''}"
     )
-    conn.commit()
-    cursor.close()
-    conn.close()
 
-# Hàm phân tích kết quả từ chuỗi input
+# Nhập kết quả thật
+async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(" ", "")
+    if not text.isdigit() or len(text) != 3:
+        await update.message.reply_text("❌ Vui lòng nhập 3 chữ số liền nhau (VD: 123)")
+        return
+    result = predict_sicbo(text)
+    await update.message.reply_text(result)
 
-def parse_result(text):
-    try:
-        parts = list(map(int, text.strip().split(" ")))
-        if len(parts) != 3 or not all(1 <= x <= 6 for x in parts):
-            return None
-        return parts
-    except:
-        return None
-
-# Tính toán dự đoán dựa trên lịch sử
-
-def predict_next():
-    conn = get_db_connection()
-    df = pd.read_sql("SELECT * FROM sicbo_results ORDER BY id DESC LIMIT 20", conn)
-    conn.close()
-
-    if len(df) < 15:
-        return "Chưa đủ dữ liệu để dự đoán."
-
-    results = [list(map(int, row.split())) for row in df['result']]
-    X = [r[:-1] for r in results[:-1]]
-    y = [sum(r) for r in results[1:]]
-
-    models = [
-        RandomForestClassifier(n_estimators=50),
-        XGBClassifier(n_estimators=50, verbosity=0),
-        MLPClassifier(max_iter=300)
-    ]
-    votes = []
-    for model in models:
-        try:
-            model.fit(X, y)
-            pred = model.predict([results[-1][:-1]])[0]
-            votes.append(pred)
-        except Exception as e:
-            logger.warning(f"Model error: {e}")
-
-    final_pred = int(sum(votes) / len(votes)) if votes else random.randint(8, 13)
-    tai_xiu = "Tài" if final_pred >= 11 else "Xỉu"
-    chan_le = "Chẵn" if final_pred % 2 == 0 else "Lẻ"
-
-    bao = results[-1][0] == results[-1][1] == results[-1][2]
-    bao_text = "\n⚠️ Có khả năng BÃO!" if bao else ""
-
-    return f"🎲 Dự đoán tiếp theo:\n- {tai_xiu} - {chan_le}\n- Tổng điểm dự đoán: {final_pred}\n{bao_text}"
-
-# Handler chính
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    result = parse_result(text)
-    if result:
-        prediction_text = predict_next()
-        save_result(" ".join(map(str, result)), prediction_text)
-        await update.message.reply_text(
-            f"✅ Đã ghi nhận kết quả: {' '.join(map(str, result))}\n{prediction_text}"
-        )
-    else:
-        await update.message.reply_text("Vui lòng nhập kết quả 3 viên xúc xắc, cách nhau bằng dấu cách. Ví dụ: 2 5 6")
-
-# Lệnh bắt đầu
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Gửi kết quả 3 viên xúc xắc (VD: 1 3 6) để bot dự đoán phiên tiếp theo!")
+    await update.message.reply_text(
+        "👋 Chào mừng đến với bot dự đoán Tài Xỉu!\n"
+        "Gửi 3 số kết quả gần nhất (VD: 123 hoặc 4 2 6) để nhận dự đoán phiên tiếp theo."
+    )
 
-# Khởi tạo bot
 async def main():
+    init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_input))
     await app.run_polling()
 
-if __name__ == '__main__':
-    import asyncio
+if __name__ == "__main__":
     asyncio.run(main())
