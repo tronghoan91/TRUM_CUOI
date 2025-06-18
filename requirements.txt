@@ -1,4 +1,5 @@
-python-telegram-bot==20.5  # downgrade để tránh lỗi Updater
+python-telegram-bot==20.5
 pandas==2.3.0
 scikit-learn==1.7.0
 xgboost==2.0.3
+psycopg2-binary
