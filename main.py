@@ -1,121 +1,160 @@
 import os
-import logging
-import psycopg2
+import random
 import numpy as np
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
-)
+import pandas as pd
+import tensorflow as tf
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from sqlalchemy import create_engine
+from datetime import datetime
+import logging
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-
-# Lấy biến môi trường
+# Đọc biến môi trường
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def create_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+# Thiết lập logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def load_latest_data():
+# Kết nối PostgreSQL
+engine = create_engine(DATABASE_URL)
+
+# Hàm đọc dữ liệu lịch sử
+def load_data():
     try:
-        conn = create_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT dice1, dice2, dice3 FROM sicbo_history ORDER BY created_at DESC LIMIT 20")
-        rows = cur.fetchall()
-        conn.close()
-        return rows
+        df = pd.read_sql("SELECT * FROM history ORDER BY created_at DESC LIMIT 100", engine)
+        return df
     except Exception as e:
-        logging.error(f"Lỗi DB: {e}")
-        return []
+        logger.error(f"Lỗi tải dữ liệu: {e}")
+        return pd.DataFrame()
 
-def preprocess_data(rows):
-    X = []
-    y = []
-    for row in rows:
-        total = sum(row)
-        label = 1 if total >= 11 else 0
-        X.append(list(row))
-        y.append(label)
-    return np.array(X), np.array(y)
+# Hàm lưu kết quả vào DB
+def save_result(real, predicted):
+    try:
+        query = f"""
+            INSERT INTO history (real_result, predicted_result, created_at)
+            VALUES ('{real}', '{predicted}', '{datetime.now()}')
+        """
+        with engine.connect() as conn:
+            conn.execute(query)
+    except Exception as e:
+        logger.error(f"Lỗi lưu dữ liệu: {e}")
 
-def train_models(X, y):
-    rf = RandomForestClassifier(n_estimators=100)
-    rf.fit(X, y)
+# Hàm xử lý dự đoán kết quả tiếp theo
+def extract_features(results):
+    features = []
+    for r in results:
+        total = sum(map(int, r.split("-")))
+        is_even = total % 2 == 0
+        is_tai = total > 10
+        is_bao = len(set(r.split("-"))) == 1
+        features.append([total, int(is_even), int(is_tai), int(is_bao)])
+    return np.array(features)
 
+# Các mô hình máy học
+def predict_with_models(X):
+    rf = RandomForestClassifier()
     xgb = XGBClassifier()
+    mlp = MLPClassifier()
+    lstm_model = Sequential([
+        LSTM(32, input_shape=(X.shape[1], 1)),
+        Dense(4, activation='softmax')
+    ])
+    lstm_model.compile(loss='categorical_crossentropy', optimizer='adam')
+
+    # Tạo nhãn giả
+    y = [random.choice(["Tài", "Xỉu", "Chẵn", "Lẻ"]) for _ in range(len(X))]
+
+    # Huấn luyện mô hình
+    rf.fit(X, y)
     xgb.fit(X, y)
+    mlp.fit(X, y)
+    X_lstm = X.reshape((X.shape[0], X.shape[1], 1))
+    y_lstm = tf.keras.utils.to_categorical([["Tài", "Xỉu", "Chẵn", "Lẻ"].index(label) for label in y], num_classes=4)
+    lstm_model.fit(X_lstm, y_lstm, epochs=5, verbose=0)
 
-    return rf, xgb
+    # Dự đoán với mẫu mới nhất
+    last_sample = X[-1].reshape(1, -1)
+    preds = [
+        rf.predict(last_sample)[0],
+        xgb.predict(last_sample)[0],
+        mlp.predict(last_sample)[0],
+        ["Tài", "Xỉu", "Chẵn", "Lẻ"][np.argmax(lstm_model.predict(last_sample.reshape((1, X.shape[1], 1)), verbose=0))]
+    ]
+    return preds
 
-def predict_next(X, models):
-    votes = [model.predict(X[-1].reshape(1, -1))[0] for model in models]
-    result = max(set(votes), key=votes.count)
-    return result, votes.count(result) / len(votes)
+# Tổng hợp kết quả
+def voting(preds):
+    return max(set(preds), key=preds.count)
 
-def format_response(real_result, prediction, confidence, stats, has_bao):
-    form = f"🎲 Đã nhận KQ thực tế: {real_result}\n"
-    form += f"📊 Dự báo phiên sau:\n"
-    form += f" - Nên vào: {'TÀI' if prediction == 1 else 'XỈU'}\n"
-    form += f" - Dải điểm: {'11-17' if prediction == 1 else '4-10'}\n"
-    if has_bao:
-        form += f"⚠️ Cảnh báo BÃO: có thể xuất hiện bộ ba giống nhau!\n"
-    form += f"✅ Dự đoán đúng {stats['correct']}/{stats['total']} phiên ({stats['accuracy']:.2f}%)"
-    return form
+# Logic mô phỏng con người
+def logic_suy_luan(recent):
+    totals = [sum(map(int, r.split("-"))) for r in recent]
+    chẵn_lẻ = ["Chẵn" if t % 2 == 0 else "Lẻ" for t in totals]
+    tai_xiu = ["Tài" if t > 10 else "Xỉu" for t in totals]
+    bao = [1 if r.split("-")[0] == r.split("-")[1] == r.split("-")[2] else 0 for r in recent]
 
+    # Dự đoán nếu có 3 lần liên tiếp giống nhau
+    if len(set(chẵn_lẻ[-3:])) == 1:
+        du_doan_le = "Chẵn" if chẵn_lẻ[-1] == "Lẻ" else "Lẻ"
+    else:
+        du_doan_le = chẵn_lẻ[-1]
+
+    if len(set(tai_xiu[-3:])) == 1:
+        du_doan_tx = "Tài" if tai_xiu[-1] == "Xỉu" else "Xỉu"
+    else:
+        du_doan_tx = tai_xiu[-1]
+
+    is_bao = any(bao[-5:])
+    return du_doan_tx, du_doan_le, is_bao
+
+# Gửi phản hồi
+async def handle_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.count("-") == 2:
+        await update.message.reply_text("⚠️ Vui lòng nhập kết quả theo định dạng: 1-3-6")
+        return
+
+    real_result = text
+    df = load_data()
+    history = df["real_result"].tolist()[-20:] if not df.empty else []
+    history.append(real_result)
+
+    X = extract_features(history)
+    preds = predict_with_models(X)
+    final_vote = voting(preds)
+
+    du_doan_tx, du_doan_le, bao = logic_suy_luan(history)
+    save_result(real_result, f"{du_doan_tx}-{du_doan_le}")
+
+    message = f"✅ Đã nhận kết quả: `{real_result}`\n\n"
+    message += f"🔮 Dự đoán phiên tiếp theo:\n"
+    message += f"- {du_doan_tx} - {du_doan_le}\n"
+    message += f"- Dải điểm nên đánh: {'11–17' if du_doan_tx == 'Tài' else '4–10'}\n"
+    if bao:
+        message += "⚠️ *Cảnh báo: Có khả năng 'Bão'!*\n"
+    message += f"\n📊 Tổng phiên đã lưu: {len(df)} | Đúng: ? | Sai: ?"
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+# Lệnh bắt đầu
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Gửi kết quả 3 xúc xắc (VD: 3 4 6) để dự đoán phiên tiếp theo!")
+    await update.message.reply_text("👋 Chào bạn! Gửi kết quả Tài Xỉu (ví dụ: `2-5-6`) để nhận dự đoán phiên tiếp theo.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        values = [int(x) for x in update.message.text.strip().split()]
-        if len(values) != 3 or any(not (1 <= x <= 6) for x in values):
-            raise ValueError
-    except:
-        await update.message.reply_text("❌ Gửi đúng 3 số từ 1–6, ví dụ: 2 4 6")
-        return
-
-    try:
-        conn = create_connection()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO sicbo_history (dice1, dice2, dice3, result, created_at) VALUES (%s, %s, %s, %s, NOW())",
-                    (*values, sum(values)))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Lỗi ghi DB: {e}")
-        await update.message.reply_text("❌ Không ghi được dữ liệu vào hệ thống.")
-        return
-
-    rows = load_latest_data()
-    if len(rows) < 6:
-        await update.message.reply_text("⏳ Cần thêm dữ liệu (ít nhất 6 phiên gần nhất).")
-        return
-
-    X, y = preprocess_data(rows)
-    rf, xgb = train_models(X, y)
-    prediction, confidence = predict_next(X, [rf, xgb])
-
-    stats = {
-        "total": len(y),
-        "correct": int(confidence * len(y)),
-        "accuracy": confidence * 100
-    }
-    has_bao = sum(1 for r in rows if r[0] == r[1] == r[2]) >= 2
-
-    await update.message.reply_text(
-        format_response(values, prediction, confidence, stats, has_bao)
-    )
-
+# Khởi tạo bot
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.run_polling()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_result))
+    print("Bot đang chạy...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
