@@ -1,105 +1,144 @@
 import os
 import asyncio
-import re
 import logging
+import random
 import psycopg2
-import pandas as pd
 import numpy as np
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
-from sklearn.preprocessing import LabelEncoder
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
+# Thiết lập logging
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+model_rf = RandomForestClassifier()
+model_xgb = XGBClassifier()
+model_mlp = MLPClassifier(max_iter=500)
 
-# Load data từ DATABASE_URL
-async def load_data():
+history = []
+
+def extract_features(sequence):
+    return [
+        sum(sequence),
+        max(sequence),
+        min(sequence),
+        sequence.count(3),
+        len(set(sequence)),
+        int(sequence == sorted(sequence)),
+    ]
+
+def label_result(nums):
+    total = sum(nums)
+    tai_xiu = "Tài" if total >= 11 else "Xỉu"
+    chan_le = "Chẵn" if total % 2 == 0 else "Lẻ"
+    is_bao = int(nums[0] == nums[1] == nums[2])
+    return tai_xiu, chan_le, is_bao
+
+def prepare_data():
     conn = psycopg2.connect(DATABASE_URL)
-    df = pd.read_sql("SELECT * FROM history ORDER BY id DESC LIMIT 1000", conn)
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS results (
+        id SERIAL PRIMARY KEY,
+        num1 INT, num2 INT, num3 INT,
+        tai_xiu TEXT, chan_le TEXT, is_bao INT
+    )""")
+    cur.execute("SELECT num1, num2, num3, tai_xiu, chan_le, is_bao FROM results ORDER BY id DESC LIMIT 1000")
+    rows = cur.fetchall()
     conn.close()
-    return df
 
-# Tiền xử lý dữ liệu
-async def preprocess(df):
-    df[['a', 'b', 'c']] = df['result'].str.extract(r'(\d)(\d)(\d)').astype(int)
-    df['sum'] = df[['a', 'b', 'c']].sum(axis=1)
-    df['tai_xiu'] = df['sum'].apply(lambda x: 1 if x >= 11 else 0)
-    df['chan_le'] = df['sum'] % 2
-    return df[['a', 'b', 'c', 'tai_xiu', 'chan_le']]
+    if len(rows) < 20:
+        return None, None
 
-# Huấn luyện mô hình
-async def train_models(df):
-    X = df[['a', 'b', 'c']]
-    y_tx = df['tai_xiu']
-    y_cl = df['chan_le']
-    rf = RandomForestClassifier().fit(X, y_tx)
-    xgb = XGBClassifier().fit(X, y_tx)
-    mlp = MLPClassifier(max_iter=500).fit(X, y_tx)
-    return rf, xgb, mlp
+    X, y_tai_xiu, y_chan_le, y_bao = [], [], [], []
+    for row in rows:
+        nums = list(map(int, row[:3]))
+        X.append(extract_features(nums))
+        y_tai_xiu.append(1 if row[3] == "Tài" else 0)
+        y_chan_le.append(1 if row[4] == "Chẵn" else 0)
+        y_bao.append(row[5])
 
-# Dự đoán kết quả
-async def predict(models, numbers):
-    X_input = np.array(numbers).reshape(1, -1)
-    votes = [model.predict(X_input)[0] for model in models]
-    tai_xiu = round(np.mean(votes))
-    chan_le = numbers[0] + numbers[1] + numbers[2]
-    chan_le = chan_le % 2
-    total = sum(numbers)
-    storm_prob = votes.count(tai_xiu) / len(votes)
-    return tai_xiu, chan_le, total, storm_prob
+    return np.array(X), {
+        "tai_xiu": np.array(y_tai_xiu),
+        "chan_le": np.array(y_chan_le),
+        "bao": np.array(y_bao)
+    }
 
-# Lưu dữ liệu mới vào database
-async def save_result(result):
+def train_models():
+    X, y_dict = prepare_data()
+    if X is None:
+        return False
+    model_rf.fit(X, y_dict["tai_xiu"])
+    model_xgb.fit(X, y_dict["chan_le"])
+    model_mlp.fit(X, y_dict["bao"])
+    return True
+
+def predict_next(nums):
+    x = np.array([extract_features(nums)])
+    tai = model_rf.predict(x)[0]
+    chan = model_xgb.predict(x)[0]
+    bao_prob = model_mlp.predict_proba(x)[0][1]
+    result = f"Dự đoán: {'Tài' if tai else 'Xỉu'} - {'Chẵn' if chan else 'Lẻ'}\n"
+    result += f"✨ Gợi ý: Điểm {'cao' if tai else 'thấp'} + {'số chẵn' if chan else 'số lẻ'}\n"
+    if bao_prob > 0.8:
+        result += f"🚨 Cảnh báo: Xác suất bão cao ({bao_prob*100:.1f}%)\n"
+    return result
+
+def save_result_to_db(nums):
+    tai_xiu, chan_le, is_bao = label_result(nums)
     conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO history (result) VALUES (%s)", (result,))
+    cur = conn.cursor()
+    cur.execute("INSERT INTO results (num1, num2, num3, tai_xiu, chan_le, is_bao) VALUES (%s, %s, %s, %s, %s, %s)",
+                (nums[0], nums[1], nums[2], tai_xiu, chan_le, is_bao))
     conn.commit()
     conn.close()
 
-# Command start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Gửi kết quả 3 số liền nhau, tôi sẽ dự đoán Tài/Xỉu - Chẵn/Lẻ cho phiên tiếp theo.")
+    await update.message.reply_text("Chào mừng bạn đến với bot dự đoán Tài Xỉu Sicbo!")
 
-# Xử lý tin nhắn chứa kết quả
-async def handle_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    match = re.fullmatch(r"\d{3}", text)
-    if not match:
-        await update.message.reply_text("Vui lòng nhập đúng định dạng 3 chữ số liền nhau. Ví dụ: 123")
+    if not text.replace(" ", "").isdigit():
+        await update.message.reply_text("Vui lòng nhập 3 số liền nhau, ví dụ: 1 3 2")
+        return
+    nums = list(map(int, text.strip().split()))
+    if len(nums) != 3:
+        await update.message.reply_text("Cần 3 số. Nhập ví dụ: 2 5 6")
         return
 
-    numbers = [int(d) for d in text]
-    await save_result(text)
+    save_result_to_db(nums)
+    ok = train_models()
+    if not ok:
+        await update.message.reply_text("Chưa đủ dữ liệu để huấn luyện. Tiếp tục nhập dữ liệu.")
+        return
 
-    df = await load_data()
-    df = await preprocess(df)
-    models = await train_models(df)
-    tai_xiu, chan_le, total, storm_prob = await predict(models, numbers)
+    result = predict_next(nums)
+    await update.message.reply_text(f"📉 Đã ghi nhận kết quả: {nums}\n" + result)
 
-    tx_text = "Tài" if tai_xiu else "Xỉu"
-    cl_text = "Chẵn" if chan_le == 0 else "Lẻ"
-    bao_text = "\n⚠️ Cảnh báo BÃO: Xác suất cao!" if storm_prob > 0.75 and numbers[0] == numbers[1] == numbers[2] else ""
-
-    await update.message.reply_text(
-        f"✅ Đã ghi nhận kết quả: {text}\n"
-        f"🔮 Dự đoán phiên tới: {tx_text} - {cl_text}\n"
-        f"🎯 Tổng: {total} → Dải nên đánh: {max(4, total-1)} - {min(17, total+1)}{bao_text}"
-    )
-
-# Main async app
 async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_result))
-    await app.run_polling()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-if __name__ == '__main__':
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await app.updater.idle()
+
+if __name__ == "__main__":
     asyncio.run(main())
