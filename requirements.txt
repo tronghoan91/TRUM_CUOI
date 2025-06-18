@@ -1,7 +1,7 @@
-flask
-python-telegram-bot==20.7
-psycopg2-binary
+python-telegram-bot==20.8
+pandas
 scikit-learn
 xgboost
-numpy
-joblib
+tensorflow
+sqlalchemy
+psycopg2-binary
