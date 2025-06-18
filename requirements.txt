@@ -2,6 +2,4 @@ python-telegram-bot==20.8
 pandas
 scikit-learn
 xgboost
-tensorflow-cpu
-sqlalchemy
 psycopg2-binary
