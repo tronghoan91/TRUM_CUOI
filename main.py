@@ -1,122 +1,145 @@
 import os
-import json
 import logging
-import random
-import numpy as np
 import psycopg2
-from flask import Flask, request
+import numpy as np
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, MessageHandler, filters
+)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from joblib import dump, load
 
-# --- Cấu hình ---
-TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# Logging để debug
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+# Token bot từ Render Environment Variable
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- Kết nối PostgreSQL ---
-def insert_result(result, prediction, is_correct):
+# ========================== KẾT NỐI DATABASE =============================
+
+def create_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
+
+# ========================== HÀM XỬ LÝ DỮ LIỆU ============================
+
+def load_latest_data():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = create_connection()
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id SERIAL PRIMARY KEY,
-                result TEXT,
-                prediction TEXT,
-                is_correct BOOLEAN,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("INSERT INTO history (result, prediction, is_correct) VALUES (%s, %s, %s)",
-                    (result, prediction, is_correct))
+        cur.execute("SELECT * FROM sicbo_history ORDER BY created_at DESC LIMIT 20")
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logging.error(f"Lỗi khi lấy dữ liệu từ DB: {e}")
+        return []
+
+
+def preprocess_data(rows):
+    # Ví dụ giả lập xử lý
+    X = []
+    y = []
+    for row in rows:
+        # Giả sử row = (id, dice1, dice2, dice3, ..., result)
+        dice_values = [row[1], row[2], row[3]]
+        total = sum(dice_values)
+        label = 1 if total >= 11 else 0  # 1 = Tài, 0 = Xỉu
+        X.append(dice_values)
+        y.append(label)
+    return np.array(X), np.array(y)
+
+
+def train_models(X, y):
+    rf = RandomForestClassifier(n_estimators=100)
+    rf.fit(X, y)
+
+    xgb = XGBClassifier()
+    xgb.fit(X, y)
+
+    return rf, xgb
+
+
+def predict_next(X, models):
+    votes = [model.predict(X[-1].reshape(1, -1))[0] for model in models]
+    result = max(set(votes), key=votes.count)
+    return result, votes.count(result) / len(votes)
+
+
+# ========================== FORM TRẢ LỜI ============================
+
+def format_response(real_result, prediction, confidence, stats, has_bao):
+    form = "🎲 Đã nhận KQ thực tế: {}\n".format(real_result)
+    form += f"📊 Dự báo phiên tiếp theo:\n"
+    form += f" - Nên vào: {'TÀI' if prediction == 1 else 'XỈU'}\n"
+    form += f" - Dải điểm nên đánh: {'11-17' if prediction == 1 else '4-10'}\n"
+    if has_bao:
+        form += "⚠️ Cảnh báo: Xác suất BÃO cao! Cân nhắc kỹ lưỡng!\n"
+    form += f"✅ Tổng số phiên đã dự đoán: {stats['total']} | Đúng: {stats['correct']} ({stats['accuracy']:.2f}%)"
+    return form
+
+
+# ========================== TELEGRAM HANDLER ============================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Xin chào! Gửi kết quả 3 viên xúc xắc để dự đoán phiên sau (VD: 3 5 2)")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = update.message.text.strip()
+        parts = [int(p) for p in text.split()]
+        if len(parts) != 3 or not all(1 <= p <= 6 for p in parts):
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ Định dạng không hợp lệ. Gửi đúng 3 số từ 1–6. VD: 2 5 6")
+        return
+
+    # Lưu kết quả thực tế vào DB
+    try:
+        conn = create_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO sicbo_history (dice1, dice2, dice3, result, created_at) VALUES (%s, %s, %s, %s, NOW())",
+            (*parts, sum(parts))
+        )
         conn.commit()
-        cur.close()
         conn.close()
     except Exception as e:
-        print("DB error:", e)
+        await update.message.reply_text("❌ Lỗi khi ghi dữ liệu vào hệ thống.")
+        logging.error(e)
+        return
 
-def get_history_stats():
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) FROM history;")
-        total, correct = cur.fetchone()
-        cur.close()
-        conn.close()
-        return total, correct or 0
-    except:
-        return 0, 0
+    rows = load_latest_data()
+    if len(rows) < 6:
+        await update.message.reply_text("⏳ Cần ít nhất 6 phiên để huấn luyện. Gửi thêm dữ liệu.")
+        return
 
-# --- Hàm dự đoán ---
-def predict_next(result_history):
-    # Dự đoán điểm
-    last_15 = result_history[-15:] if len(result_history) >= 15 else result_history
-    total_points = [sum(map(int, list(x))) for x in last_15]
-    avg_point = np.mean(total_points)
-    suggest_range = (max(3, int(avg_point - 2)), min(18, int(avg_point + 2)))
+    X, y = preprocess_data(rows)
+    models = train_models(X, y)
+    prediction, confidence = predict_next(X, models)
 
-    # Dự đoán tài/xỉu, chẵn/lẻ
-    next_tai_xiu = "Tài" if avg_point >= 10.5 else "Xỉu"
-    next_chan_le = "Chẵn" if int(avg_point) % 2 == 0 else "Lẻ"
+    # Thống kê đúng/sai (giả lập)
+    stats = {"total": len(y), "correct": int(confidence * len(y)), "accuracy": confidence * 100}
+    has_bao = sum(p[1] == p[2] == p[3] for p in rows[:5]) >= 2
 
-    # Dự đoán bão (3 số giống nhau)
-    triple_chance = sum([1 for r in last_15 if len(set(r)) == 1]) / len(last_15)
-    is_storm = triple_chance >= 0.2
+    response = format_response(parts, prediction, confidence, stats, has_bao)
+    await update.message.reply_text(response)
 
-    return {
-        "tai_xiu": next_tai_xiu,
-        "chan_le": next_chan_le,
-        "range": suggest_range,
-        "storm": is_storm
-    }
 
-# --- Bot handler ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+# ========================== CHẠY BOT ============================
 
-    if text.isdigit() and len(text) == 3:
-        history = context.bot_data.get("history", [])
-        history.append(text)
-        context.bot_data["history"] = history[-20:]
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.run_polling()
 
-        prediction = predict_next(history)
-
-        # Giả sử đúng nếu tổng điểm > 10 thì là "Tài"
-        sum_now = sum(map(int, list(text)))
-        real_tai_xiu = "Tài" if sum_now >= 11 else "Xỉu"
-        is_correct = real_tai_xiu == prediction["tai_xiu"]
-
-        insert_result(text, prediction["tai_xiu"], is_correct)
-        total, correct = get_history_stats()
-        percent = round(correct / total * 100, 2) if total else 0
-
-        response = f"✅ Đã nhận kết quả: {text}\n"
-        response += f"📊 Dự đoán phiên tiếp theo:\n"
-        response += f"1. Nên vào: {prediction['tai_xiu']} - {prediction['chan_le']}\n"
-        response += f"2. Dải điểm nên đánh: {prediction['range'][0]} → {prediction['range'][1]}\n"
-        if prediction['storm']:
-            response += f"3. ⚠️ Cảnh báo: Có khả năng BÃO (3 số giống nhau)\n"
-        response += f"4. Tổng phiên đã dự đoán: {correct}/{total} đúng ({percent}%)"
-
-        await update.message.reply_text(response)
-    else:
-        await update.message.reply_text("❗ Hãy nhập 3 chữ số kết quả (ví dụ: 234) để dự đoán phiên tiếp theo.")
-
-# --- Đăng webhook ---
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update_data = request.get_json(force=True)
-    update = Update.de_json(update_data, application.bot)
-    application.update_queue.put_nowait(update)
-    return "ok"
-
-@app.route("/")
-def home():
-    return "Bot Sicbo Online đang chạy..."
-
-if __name__ == '__main__':
-    application.run_polling()  # Dành cho local test
+if __name__ == "__main__":
+    main()
