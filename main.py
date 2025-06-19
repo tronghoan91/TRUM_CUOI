@@ -12,17 +12,15 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
 
-# --- Cấu hình ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL_PATH = os.getenv("MODEL_PATH", "/tmp/sicbo_model.joblib")   # Chuẩn Render
+MODEL_PATH = os.getenv("MODEL_PATH", "/tmp/sicbo_model.joblib")
 
 MIN_ACCURACY = 0.5
 WINDOW_SIZE = 40
 
 logging.basicConfig(level=logging.INFO)
 
-# --- DB ---
 def get_db_conn():
     return psycopg2.connect(DATABASE_URL)
 
