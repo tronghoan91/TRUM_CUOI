@@ -45,6 +45,10 @@ MIN_ACCURACY = 0.5
 WINDOW_SIZE = 40
 FEATURE_WINDOW = 3  # Số phiên gần nhất dùng làm feature
 
+# --- Tối ưu tốc độ retrain ---
+RETRAIN_EVERY_N = 10
+retrain_counter = 0
+
 logging.basicConfig(level=logging.INFO)
 
 def get_db_conn():
@@ -138,7 +142,14 @@ def label_func(nums):
 def is_bao(nums):
     return int(len(set(nums)) == 1)
 
+def get_total_history_count():
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM history WHERE actual IS NOT NULL")
+            return cur.fetchone()[0]
+
 def train_and_save_model():
+    total = get_total_history_count()
     df = fetch_history(5000)
     if df.empty:
         return None
@@ -146,6 +157,7 @@ def train_and_save_model():
     if len(df) < 30:
         print("Not enough data to train model. Need at least 30 rows.")
         return None
+
     X, y = [], []
     for i in range(len(df)):
         history_inputs = []
@@ -156,14 +168,23 @@ def train_and_save_model():
             history_inputs.insert(0, nums)
         X.append(get_window_features(history_inputs))
         y.append(df.iloc[i]["actual"])
-    models = [
-        ("rf", RandomForestClassifier(n_estimators=100)),
-        ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
-        ("lgb", LGBMClassifier(n_estimators=100)),
-        ("cat", CatBoostClassifier(verbose=0, iterations=100)),
-        ("mlp", MLPClassifier(max_iter=2000)),
-        ("lr", LogisticRegression(max_iter=1000))
-    ]
+
+    # Dưới 200 phiên chỉ dùng 3 model mạnh nhất, trên 200 dùng đủ 6 model
+    if total < 200:
+        models = [
+            ("rf", RandomForestClassifier(n_estimators=100)),
+            ("xgb", XGBoostClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+            ("lr", LogisticRegression(max_iter=1000))
+        ]
+    else:
+        models = [
+            ("rf", RandomForestClassifier(n_estimators=100)),
+            ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+            ("lgb", LGBMClassifier(n_estimators=100)),
+            ("cat", CatBoostClassifier(verbose=0, iterations=100)),
+            ("mlp", MLPClassifier(max_iter=2000)),
+            ("lr", LogisticRegression(max_iter=1000))
+        ]
     ensemble = VotingClassifier(estimators=models, voting='hard')
     ensemble.fit(X, y)
     dump(ensemble, MODEL_PATH)
@@ -193,6 +214,7 @@ def train_with_recent_data(n=100):
     if len(df) < 30:
         print("Not enough data for LightGBM!")
         return None
+    total = get_total_history_count()
     X, y = [], []
     for i in range(len(df)):
         history_inputs = []
@@ -203,14 +225,21 @@ def train_with_recent_data(n=100):
             history_inputs.insert(0, nums)
         X.append(get_window_features(history_inputs))
         y.append(df.iloc[i]["actual"])
-    models = [
-        ("rf", RandomForestClassifier(n_estimators=100)),
-        ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
-        ("lgb", LGBMClassifier(n_estimators=100)),
-        ("cat", CatBoostClassifier(verbose=0, iterations=100)),
-        ("mlp", MLPClassifier(max_iter=2000)),
-        ("lr", LogisticRegression(max_iter=1000))
-    ]
+    if total < 200:
+        models = [
+            ("rf", RandomForestClassifier(n_estimators=100)),
+            ("xgb", XGBoostClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+            ("lr", LogisticRegression(max_iter=1000))
+        ]
+    else:
+        models = [
+            ("rf", RandomForestClassifier(n_estimators=100)),
+            ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+            ("lgb", LGBMClassifier(n_estimators=100)),
+            ("cat", CatBoostClassifier(verbose=0, iterations=100)),
+            ("mlp", MLPClassifier(max_iter=2000)),
+            ("lr", LogisticRegression(max_iter=1000))
+        ]
     ensemble = VotingClassifier(estimators=models, voting='hard')
     ensemble.fit(X, y)
     dump(ensemble, MODEL_PATH)
@@ -324,18 +353,13 @@ def get_trend_msg(stats, streak, last, trend, bao_warn):
         msg += " Đặc biệt chú ý khả năng bão!"
     return msg
 
-def get_total_history_count():
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM history WHERE actual IS NOT NULL")
-            return cur.fetchone()[0]
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Gửi 3 số kết quả gần nhất để nhận dự đoán (ví dụ: 456 hoặc 4 5 6). Gõ /backup để xuất lịch sử ra file."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global retrain_counter
     text = update.message.text.strip()
 
     # Check nhập nhầm, nhập lặp (so với phiên trước)
@@ -379,7 +403,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn2.commit()
         total = get_total_history_count()
         await update.message.reply_text(f"✅ Đã ghi nhận kết quả thực tế phiên mới. Tổng số phiên đã ghi nhận: {total}")
-        retrain_needed = True  # Chỉ retrain khi có actual mới
+        retrain_counter += 1
+        if retrain_counter >= RETRAIN_EVERY_N:
+            retrain_needed = True
+            retrain_counter = 0
 
     # Phát hiện đổi thuật toán
     algo_changed = detect_algo_change()
@@ -388,6 +415,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ BOT phát hiện tỉ lệ dự đoán đúng giảm mạnh! Game có thể đã đổi thuật toán. BOT sẽ tự động học lại sóng mới."
         )
         retrain_needed = True
+        retrain_counter = 0
 
     # Lấy các phiên trước cho feature chuỗi
     df_hist = fetch_history(FEATURE_WINDOW-1, with_actual=False)
