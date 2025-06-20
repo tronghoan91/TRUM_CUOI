@@ -16,6 +16,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from datetime import datetime
 import threading
 from flask import Flask
+import asyncio
 
 # ==== Flask giữ port tránh sleep ====
 def start_flask():
@@ -368,6 +369,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with conn.cursor() as cur:
             cur.execute("SELECT id, input FROM history WHERE actual IS NULL ORDER BY id DESC LIMIT 1")
             last_entry = cur.fetchone()
+    retrain_needed = False
     if last_entry:
         last_id, last_input = last_entry
         actual_label = label_func(numbers)
@@ -375,21 +377,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with conn2.cursor() as cur2:
                 cur2.execute("UPDATE history SET actual = %s WHERE id = %s", (actual_label, last_id))
                 conn2.commit()
-        train_and_save_model()
-        train_bao_model()
-        train_total_model()
         total = get_total_history_count()
         await update.message.reply_text(f"✅ Đã ghi nhận kết quả thực tế phiên mới. Tổng số phiên đã ghi nhận: {total}")
+        retrain_needed = True  # Chỉ retrain khi có actual mới
 
     # Phát hiện đổi thuật toán
     algo_changed = detect_algo_change()
     if algo_changed:
-        train_with_recent_data(WINDOW_SIZE * 2)
-        train_bao_model()
-        train_total_model()
         await update.message.reply_text(
             f"⚠️ BOT phát hiện tỉ lệ dự đoán đúng giảm mạnh! Game có thể đã đổi thuật toán. BOT sẽ tự động học lại sóng mới."
         )
+        retrain_needed = True
 
     # Lấy các phiên trước cho feature chuỗi
     df_hist = fetch_history(FEATURE_WINDOW-1, with_actual=False)
@@ -448,6 +446,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response += f"\n{bao_warn}"
 
     await update.message.reply_text(response.strip())
+
+    # ==== RETRAIN SAU KHI ĐÃ TRẢ LỜI USER (nếu cần) ====
+    if retrain_needed:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, train_and_save_model)
+        await loop.run_in_executor(None, train_bao_model)
+        await loop.run_in_executor(None, train_total_model)
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000, with_actual=False)
