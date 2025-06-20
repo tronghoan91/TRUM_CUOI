@@ -7,6 +7,8 @@ from flask import Flask
 import threading
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from datetime import datetime
+import re
 
 def start_flask():
     app = Flask(__name__)
@@ -28,6 +30,20 @@ logging.basicConfig(level=logging.INFO)
 def get_db_conn():
     return psycopg2.connect(DATABASE_URL)
 
+def create_table():
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS history (
+                    id SERIAL PRIMARY KEY,
+                    input TEXT,
+                    prediction TEXT,
+                    actual TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            conn.commit()
+
 def fetch_history(limit=10000):
     with get_db_conn() as conn:
         query = """
@@ -39,11 +55,41 @@ def fetch_history(limit=10000):
         df = pd.read_sql(query, conn, params=(limit,))
     return df
 
+def fetch_history_all(limit=10000):
+    with get_db_conn() as conn:
+        query = """
+        SELECT id, input, prediction, actual, created_at 
+        FROM history 
+        ORDER BY id ASC LIMIT %s
+        """
+        df = pd.read_sql(query, conn, params=(limit,))
+    return df
+
 def get_history_count():
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM history WHERE actual IS NOT NULL")
             return cur.fetchone()[0]
+
+def insert_to_history(input_str, prediction, actual=None):
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO history (input, prediction, actual, created_at) VALUES (%s, %s, %s, %s)",
+                (input_str, prediction, actual, datetime.now())
+            )
+            conn.commit()
+
+def update_actual_for_last(input_str, actual):
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE history 
+                SET actual = %s
+                WHERE input = %s AND actual IS NULL
+                ORDER BY id DESC LIMIT 1
+            """, (actual, input_str))
+            conn.commit()
 
 def bot_smart_reply(df, best_totals, prediction=None):
     total = len(df)
@@ -119,14 +165,40 @@ def get_stats_message(df):
         f"Tỷ lệ đổi cầu (flip rate): {round(flip_rate*100, 2)}%\n"
     )
 
+reset_confirm = {}
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        df = fetch_history(1000)
-    except Exception as e:
-        await update.message.reply_text(f"Lỗi kết nối database: {e}")
+    text = update.message.text.strip()
+    create_table()
+    # Kiểm tra nhập kết quả (số)
+    if re.match(r"^\d{3}$", text):
+        numbers = [int(x) for x in text]
+        input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
+    elif re.match(r"^\d+ \d+ \d+$", text):
+        numbers = [int(x) for x in text.split()]
+        input_str = text
+    else:
+        await update.message.reply_text("Vui lòng nhập 3 số liền nhau (VD: 345) hoặc 3 số cách nhau bằng dấu cách (VD: 3 4 5).")
         return
+
+    # Prediction dựa vào tổng
+    total = sum(numbers)
+    prediction = "Tài" if total >= 11 else "Xỉu"
+    best_totals = [total]
+
+    # Lưu vào lịch sử (prediction, chưa có actual)
+    insert_to_history(input_str, prediction, actual=None)
+
+    # Nếu đã có actual thực tế, cập nhật vào phiên gần nhất
+    # Ví dụ, người chơi nhập lại input này (lần 2) sẽ coi là actual (bổ sung cho phiên trước chưa có actual)
+    last_df = fetch_history_all(10)
+    if last_df[(last_df['input'] == input_str) & (last_df['actual'].isnull())].shape[0] > 0:
+        actual = prediction  # Nếu muốn, bạn có thể nhập thực tế khác, ở đây mặc định lấy prediction
+        update_actual_for_last(input_str, actual)
+
+    # Trả lời bằng phân tích lịch sử
+    df = fetch_history(1000)
     best_totals = suggest_best_totals(df)
-    prediction = None
     if best_totals:
         prediction = "Tài" if best_totals[0] >= 11 else "Xỉu"
     msg = bot_smart_reply(df, best_totals, prediction)
@@ -141,26 +213,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/count - Đếm tổng số phiên đã nhập và lưu\n"
         "/reset - Reset toàn bộ lịch sử (Cẩn thận, không thể khôi phục)\n"
         "/backup - Xuất file lịch sử ra CSV\n"
-        "Hoặc chỉ cần gửi bất kỳ tin nhắn nào để nhận dự đoán, phân tích, tổng nên đánh!"
+        "Hoặc chỉ cần gửi bất kỳ tin nhắn nào để nhận dự đoán, phân tích, tổng nên đánh!\n"
+        "Gửi 3 số bất kỳ để thêm 1 phiên mới vào lịch sử!"
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        df = fetch_history(1000)
-        msg = get_stats_message(df)
-    except Exception as e:
-        msg = f"Lỗi: {e}"
+    create_table()
+    df = fetch_history(1000)
+    msg = get_stats_message(df)
     await update.message.reply_text(msg)
 
-async def count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        count = get_history_count()
-        await update.message.reply_text(f"Đã có tổng cộng {count} phiên dữ liệu được lưu.")
-    except Exception as e:
-        await update.message.reply_text(f"Lỗi: {e}")
-
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = fetch_history(10000)
+    create_table()
+    df = fetch_history_all(10000)
     if df.empty:
         await update.message.reply_text("Không có dữ liệu để backup.")
         return
@@ -169,11 +234,10 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df.to_csv(path, index=False)
     await update.message.reply_document(document=open(path, "rb"), filename=f"sicbo_history_backup_{now_str}.csv")
 
-reset_confirm = {}
-
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if reset_confirm.get(user_id):
+        create_table()
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM history")
@@ -187,13 +251,19 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Gõ lại /reset lần nữa để xác nhận."
         )
 
+async def count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    create_table()
+    count = get_history_count()
+    await update.message.reply_text(f"Đã có tổng cộng {count} phiên dữ liệu được lưu.")
+
 def main():
+    create_table()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("count", count))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("count", count))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
