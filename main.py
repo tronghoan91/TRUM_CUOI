@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import threading
 from flask import Flask
 
-# ----- Giữ port cho Render/UptimeRobot -----
+# ==== Flask giữ port tránh sleep ====
 def start_flask():
     app = Flask(__name__)
 
@@ -30,7 +30,7 @@ def start_flask():
     app.run(host='0.0.0.0', port=10000)
 
 threading.Thread(target=start_flask, daemon=True).start()
-# -------------------------------------------
+# ====================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -39,7 +39,7 @@ BAO_MODEL_PATH = os.getenv("BAO_MODEL_PATH", "/tmp/bao_model.joblib")
 
 MIN_ACCURACY = 0.5
 WINDOW_SIZE = 40
-FEATURE_WINDOW = 3  # Lấy 3 phiên gần nhất
+FEATURE_WINDOW = 3  # Số phiên gần nhất dùng làm feature
 
 logging.basicConfig(level=logging.INFO)
 
@@ -232,7 +232,6 @@ def generate_response(prediction, input_text, stats, time_msg, explain_msg="", b
     tai_xiu = "Tài" if total >= 11 else "Xỉu"
     chan_le = "Chẵn" if total % 2 == 0 else "Lẻ"
     bao = "🎲 BÃO! Ba số giống nhau!" if len(set(nums)) == 1 else ""
-    # Gọn gàng cho thực chiến
     response = (
         f"🎯 {prediction}\n"
         f"🔢 Tổng: {total} ({tai_xiu} - {chan_le})\n"
@@ -276,7 +275,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # Chuẩn hóa input: '123' hoặc '1 2 3' đều được
+    # Check nhập nhầm, nhập lặp (so với phiên trước)
+    df_hist_check = fetch_history(1, with_actual=False)
+    if df_hist_check.shape[0] > 0:
+        last_input_str = df_hist_check.iloc[0]["input"]
+        # Chuẩn hóa input hiện tại về dạng 3 số cách nhau
+        if re.match(r"^\d{3}$", text):
+            this_input = f"{text[0]} {text[1]} {text[2]}"
+        elif re.match(r"^\d+ \d+ \d+$", text):
+            this_input = text
+        else:
+            this_input = ""
+        if last_input_str == this_input:
+            await update.message.reply_text("⚠️ Bạn vừa nhập kết quả này ở phiên trước. Nếu nhập nhầm, gửi lại đúng kết quả mới!")
+            return
+
+    # Chuẩn hóa input: '123' hoặc '1 2 3'
     if re.match(r"^\d{3}$", text):
         numbers = [int(x) for x in text]
         input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
@@ -308,8 +322,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         train_with_recent_data(WINDOW_SIZE * 2)
         train_bao_model()
         await update.message.reply_text(
-            f"⚠️ BOT phát hiện tỉ lệ dự đoán đúng giảm mạnh! Game có thể đã đổi thuật toán. "
-            f"BOT sẽ tự động học lại với sóng mới!"
+            f"⚠️ BOT phát hiện tỉ lệ dự đoán đúng giảm mạnh! Game có thể đã đổi thuật toán. BOT sẽ tự động học lại sóng mới."
         )
 
     # Lấy các phiên trước cho feature chuỗi
@@ -332,15 +345,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_msg = time_diff_message(get_last_play_time())
     explain_msg = explain_prediction(features, input_data, prev_inputs)
 
-    # Dự đoán "bão" phiên tới
+    # Dự đoán "bão" phiên tiếp theo: chỉ cảnh báo nếu phiên hiện tại KHÔNG phải bão
     bao_warn = ""
-    if bao_model:
+    if bao_model and len(set(input_data)) != 1:
         bao_prob = predict_bao_prob(bao_model, input_data, prev_inputs)
         if bao_prob > 0.08:
-            bao_warn = f"⚡️ Dự báo: Khả năng ra BÃO phiên tới cao bất thường! (Xác suất ~{bao_prob:.1%})"
+            bao_warn = f"⚡️ Dự báo: Phiên tiếp theo có khả năng xuất hiện BÃO bất thường! (Xác suất ~{bao_prob:.1%})"
 
     response = generate_response(prediction, input_str, stats, time_msg, explain_msg, bao_warn)
-    # Cảnh báo data ít
     if stats['correct'] + stats['wrong'] < 15:
         response += "\n⚠️ Dữ liệu còn ít, chỉ nên tham khảo!"
     await update.message.reply_text(response)
@@ -350,9 +362,11 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if df.empty:
         await update.message.reply_text("⚠️ Không có dữ liệu để backup.")
         return
-    path = "/tmp/sicbo_history_backup.csv"
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = f"/tmp/sicbo_history_backup_{now_str}.csv"
     df.to_csv(path, index=False)
-    await update.message.reply_document(document=open(path, "rb"), filename="sicbo_history_backup.csv")
+    await update.message.reply_document(document=open(path, "rb"), filename=f"sicbo_history_backup_{now_str}.csv")
 
 def main():
     create_table()
