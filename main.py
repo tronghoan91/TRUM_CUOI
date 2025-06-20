@@ -37,28 +37,17 @@ def create_table():
                 CREATE TABLE IF NOT EXISTS history (
                     id SERIAL PRIMARY KEY,
                     input TEXT,
-                    prediction TEXT,
                     actual TEXT,
+                    bot_predict TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
             conn.commit()
 
-def fetch_history(limit=10000):
-    with get_db_conn() as conn:
-        query = """
-        SELECT id, input, prediction, actual, created_at 
-        FROM history 
-        WHERE actual IS NOT NULL 
-        ORDER BY id ASC LIMIT %s
-        """
-        df = pd.read_sql(query, conn, params=(limit,))
-    return df
-
 def fetch_history_all(limit=10000):
     with get_db_conn() as conn:
         query = """
-        SELECT id, input, prediction, actual, created_at 
+        SELECT id, input, actual, bot_predict, created_at 
         FROM history 
         ORDER BY id ASC LIMIT %s
         """
@@ -68,163 +57,131 @@ def fetch_history_all(limit=10000):
 def get_history_count():
     with get_db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM history WHERE actual IS NOT NULL")
+            cur.execute("SELECT COUNT(*) FROM history")
             return cur.fetchone()[0]
 
-def insert_to_history(input_str, prediction, actual=None):
+def insert_to_history(input_str, actual, bot_predict=None):
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO history (input, prediction, actual, created_at) VALUES (%s, %s, %s, %s)",
-                (input_str, prediction, actual, datetime.now())
+                "INSERT INTO history (input, actual, bot_predict, created_at) VALUES (%s, %s, %s, %s)",
+                (input_str, actual, bot_predict, datetime.now())
             )
             conn.commit()
 
-# --- ĐÃ SỬA lỗi update actual cho đúng chuẩn PostgreSQL! ---
-def update_actual_for_last(input_str, actual):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE history SET actual = %s
-                WHERE id = (
-                    SELECT id FROM history
-                    WHERE input = %s AND actual IS NULL
-                    ORDER BY id DESC LIMIT 1
-                )
-            """, (actual, input_str))
-            conn.commit()
-
-def bot_smart_reply(df, best_totals, prediction=None):
-    total = len(df)
-    correct = sum(df['prediction'] == df['actual'])
-    wrong = total - correct
-    accuracy = round(correct/total*100, 2) if total > 0 else 0
-    acc = correct/total if total > 0 else 0
-    actuals = df['actual'].tolist()
-    streak = 1
-    last = actuals[-1] if actuals else None
-    for v in reversed(actuals[:-1]):
-        if v == last:
-            streak += 1
-        else:
-            break
-    flip_count = sum([actuals[i]!=actuals[i-1] for i in range(1, len(actuals))]) if total > 1 else 0
-    flip_rate = flip_count/(len(actuals)-1) if total > 1 else 0
-    msg_predict = ""
-    note = ""
-    if total < 10:
-        msg_predict = "Chưa đủ dữ liệu để dự đoán chắc chắn."
-        note = "Hãy nhập thêm kết quả thực tế để BOT học và phân tích chính xác hơn."
-    elif acc < 0.48 or flip_rate > 0.75 or streak <= 2 and acc < 0.52:
-        msg_predict = "DỰ ĐOÁN: Phiên này nên nghỉ vì xác suất đúng thấp hoặc cầu nhiễu."
-        note = "Thị trường nguy hiểm, accuracy thấp, flip nhiều. Đề nghị quan sát hoặc nghỉ."
-    elif streak >= 4:
-        msg_predict = f"DỰ ĐOÁN: {last.upper()} (trend rõ, {streak} phiên liên tiếp)"
-        note = f"Trend mạnh, có thể theo {last.title()} nhưng kiểm soát vốn!"
-    elif prediction:
-        msg_predict = f"DỰ ĐOÁN: {prediction}"
-        note = "Cầu bình thường, chưa rõ trend mạnh, vào nhẹ hoặc quan sát thêm."
-    else:
-        msg_predict = "Không rõ trend, nên quan sát thêm!"
-        note = "Bạn nên nhập thêm nhiều phiên thực tế để BOT phân tích tốt hơn."
-    msg = (
-        f"{msg_predict}\n"
-        f"Dải tổng nên đánh: {', '.join(str(x) for x in best_totals)}\n"
-        f"Số phiên đã ghi nhận: {total} (Đúng: {correct} | Sai: {wrong} | Chính xác: {accuracy}%)\n\n"
-        f"Phân tích: {note}"
-    )
-    return msg
-
-def suggest_best_totals(df):
-    if df.empty:
+def suggest_best_totals(df_with_actual):
+    if df_with_actual.empty:
         return [11, 12, 13]
-    total_list = [sum(int(x) for x in s.split()) for s in df['input']]
+    total_list = [sum(int(x) for x in s.split()) for s in df_with_actual['input']]
     c = Counter(total_list)
     common = [k for k, v in c.most_common(3)]
     if len(common) < 3:
         common = [11, 12, 13]
     return common
 
-def get_stats_message(df):
-    total = len(df)
-    correct = sum(df['prediction'] == df['actual'])
-    wrong = total - correct
-    accuracy = round(correct/total*100, 2) if total > 0 else 0
-    actuals = df['actual'].tolist()
-    streak = 1
-    last = actuals[-1] if actuals else None
-    for v in reversed(actuals[:-1]):
-        if v == last:
-            streak += 1
+def analyze_trend_and_predict(df_with_actual):
+    note = ""
+    prediction = None
+    if len(df_with_actual) >= 8:
+        actuals = df_with_actual['actual'].tolist()
+        streak = 1
+        last = actuals[-1]
+        for v in reversed(actuals[:-1]):
+            if v == last:
+                streak += 1
+            else:
+                break
+        flip_count = sum([actuals[i]!=actuals[i-1] for i in range(1, len(actuals))])
+        flip_rate = flip_count/(len(actuals)-1) if len(actuals)>1 else 0
+        acc = sum(df_with_actual['bot_predict']==df_with_actual['actual'])/len(df_with_actual) if 'bot_predict' in df_with_actual else 0
+        if acc < 0.48 or flip_rate > 0.75 or (streak <= 2 and acc < 0.52):
+            note = "⚠️ Cầu nhiễu, tỉ lệ đúng thấp. Nên nghỉ hoặc chỉ quan sát."
+            prediction = None
+        elif streak >= 4:
+            note = f"🔥 Trend rõ: {last.upper()} {streak} phiên liên tiếp! Nên theo trend này."
+            prediction = last
         else:
-            break
-    flip_count = sum([actuals[i]!=actuals[i-1] for i in range(1, len(actuals))]) if total > 1 else 0
-    flip_rate = flip_count/(len(actuals)-1) if total > 1 else 0
-    return (
-        f"THỐNG KÊ DỮ LIỆU:\n"
-        f"Số phiên đã ghi nhận: {total}\n"
-        f"Đúng: {correct} | Sai: {wrong} | Chính xác: {accuracy}%\n"
-        f"Chuỗi {last or '-'} hiện tại: {streak} phiên\n"
-        f"Tỷ lệ đổi cầu (flip rate): {round(flip_rate*100, 2)}%\n"
+            note = "Cầu bình thường, chưa rõ trend mạnh, vào nhẹ hoặc quan sát."
+            prediction = None
+    else:
+        note = "Chưa đủ dữ liệu thực tế để phân tích trend."
+        prediction = None
+    return prediction, note
+
+def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note):
+    tong = len(df_all)
+    # Chỉ thống kê các phiên bot thực sự dự đoán (Tài/Xỉu)
+    df_predict = df_with_actual[df_with_actual['bot_predict'].isin(["Tài", "Xỉu"])]
+    so_du_doan = len(df_predict)
+    dung = sum(df_predict['bot_predict'] == df_predict['actual'])
+    sai = so_du_doan - dung
+    tile = round((dung/so_du_doan)*100, 2) if so_du_doan else 0
+
+    msg = (
+        f"Số phiên đã lưu: {tong}\n"
+        f"Số phiên đã dự đoán (Tài/Xỉu): {so_du_doan} (Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%)\n"
+        f"Dự đoán phiên này: {prediction or '-'}\n"
+        f"Dải tổng nên đánh: {', '.join(str(x) for x in best_totals)}\n"
+        f"{trend_note}"
     )
+    return msg
 
 reset_confirm = {}
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     create_table()
-    # Kiểm tra nhập kết quả (số)
-    # Cho phép nhập 3 số liền nhau hoặc cách nhau dấu cách
     m = re.match(r"^(\d{3})$", text)
     m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
-    if m:
-        numbers = [int(x) for x in m.group(1)]
+    if m or m2:
+        if m:
+            numbers = [int(x) for x in m.group(1)]
+        else:
+            numbers = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
         input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
-    elif m2:
-        numbers = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
-        input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
-    else:
-        await update.message.reply_text("Vui lòng nhập 3 số liền nhau (VD: 345) hoặc 3 số cách nhau bằng dấu cách (VD: 3 4 5).")
+        total = sum(numbers)
+        actual = "Tài" if total >= 11 else "Xỉu"
+
+        # Lấy lịch sử trước khi insert
+        df_all = fetch_history_all(10000)
+        df_with_actual = df_all[df_all['actual'].notnull()]
+
+        # Phân tích trend và quyết định prediction linh động
+        prediction, trend_note = analyze_trend_and_predict(df_with_actual)
+        # Nếu bot quyết định dự đoán thì ghi vào cột bot_predict
+        insert_to_history(input_str, actual, prediction)
+
+        # Thống kê lại sau khi thêm
+        df_all = fetch_history_all(10000)
+        df_with_actual = df_all[df_all['actual'].notnull()]
+        best_totals = suggest_best_totals(df_with_actual) if not df_with_actual.empty else [11,12,13]
+        msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note)
+        await update.message.reply_text(msg)
         return
 
-    # Prediction dựa vào tổng
-    total = sum(numbers)
-    prediction = "Tài" if total >= 11 else "Xỉu"
-
-    # Lưu vào lịch sử (prediction, chưa có actual)
-    insert_to_history(input_str, prediction, actual=None)
-
-    # Nếu đã nhập actual cho phiên này (giả định nhập lặp lại input), cập nhật vào phiên chưa có actual gần nhất
-    last_df = fetch_history_all(10)
-    if last_df[(last_df['input'] == input_str) & (last_df['actual'].isnull())].shape[0] > 0:
-        actual = prediction  # (Ở đây lấy prediction làm actual, muốn linh hoạt thì chỉnh lại)
-        update_actual_for_last(input_str, actual)
-
-    # Trả lời bằng phân tích lịch sử
-    df = fetch_history(1000)
-    best_totals = suggest_best_totals(df)
-    if best_totals:
-        prediction = "Tài" if best_totals[0] >= 11 else "Xỉu"
-    msg = bot_smart_reply(df, best_totals, prediction)
-    await update.message.reply_text(msg)
+    await update.message.reply_text(
+        "Vui lòng nhập dãy 3 số kết quả thực tế (ví dụ: 4 5 6 hoặc 456)."
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Xin chào! Đây là Sicbo RealBot.\n"
         "Các lệnh bạn có thể dùng:\n"
         "/start - Xem giới thiệu và lệnh\n"
-        "/stats - Xem thống kê dữ liệu, chuỗi thắng/thua, flip rate\n"
-        "/count - Đếm tổng số phiên đã nhập và lưu\n"
+        "/stats - Xem thống kê dữ liệu, trend, chuỗi thắng/thua\n"
+        "/count - Đếm tổng số phiên đã nhập\n"
         "/reset - Reset toàn bộ lịch sử (Cẩn thận, không thể khôi phục)\n"
         "/backup - Xuất file lịch sử ra CSV\n"
-        "Hoặc chỉ cần gửi bất kỳ tin nhắn nào để nhận dự đoán, phân tích, tổng nên đánh!\n"
-        "Gửi 3 số bất kỳ để thêm 1 phiên mới vào lịch sử!"
+        "Gửi 3 số kết quả (ví dụ: 3 5 6 hoặc 356), bot sẽ tự tính toán, thống kê, phân tích trend và dự đoán siêu linh động!"
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     create_table()
-    df = fetch_history(1000)
-    msg = get_stats_message(df)
+    df_all = fetch_history_all(10000)
+    df_with_actual = df_all[df_all['actual'].notnull()]
+    prediction, trend_note = analyze_trend_and_predict(df_with_actual)
+    best_totals = suggest_best_totals(df_with_actual) if not df_with_actual.empty else [11,12,13]
+    msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note)
     await update.message.reply_text(msg)
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
