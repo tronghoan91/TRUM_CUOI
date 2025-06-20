@@ -80,14 +80,17 @@ def insert_to_history(input_str, prediction, actual=None):
             )
             conn.commit()
 
+# --- ĐÃ SỬA lỗi update actual cho đúng chuẩn PostgreSQL! ---
 def update_actual_for_last(input_str, actual):
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE history 
-                SET actual = %s
-                WHERE input = %s AND actual IS NULL
-                ORDER BY id DESC LIMIT 1
+                UPDATE history SET actual = %s
+                WHERE id = (
+                    SELECT id FROM history
+                    WHERE input = %s AND actual IS NULL
+                    ORDER BY id DESC LIMIT 1
+                )
             """, (actual, input_str))
             conn.commit()
 
@@ -171,12 +174,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     create_table()
     # Kiểm tra nhập kết quả (số)
-    if re.match(r"^\d{3}$", text):
-        numbers = [int(x) for x in text]
+    # Cho phép nhập 3 số liền nhau hoặc cách nhau dấu cách
+    m = re.match(r"^(\d{3})$", text)
+    m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
+    if m:
+        numbers = [int(x) for x in m.group(1)]
         input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
-    elif re.match(r"^\d+ \d+ \d+$", text):
-        numbers = [int(x) for x in text.split()]
-        input_str = text
+    elif m2:
+        numbers = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
+        input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
     else:
         await update.message.reply_text("Vui lòng nhập 3 số liền nhau (VD: 345) hoặc 3 số cách nhau bằng dấu cách (VD: 3 4 5).")
         return
@@ -184,16 +190,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Prediction dựa vào tổng
     total = sum(numbers)
     prediction = "Tài" if total >= 11 else "Xỉu"
-    best_totals = [total]
 
     # Lưu vào lịch sử (prediction, chưa có actual)
     insert_to_history(input_str, prediction, actual=None)
 
-    # Nếu đã có actual thực tế, cập nhật vào phiên gần nhất
-    # Ví dụ, người chơi nhập lại input này (lần 2) sẽ coi là actual (bổ sung cho phiên trước chưa có actual)
+    # Nếu đã nhập actual cho phiên này (giả định nhập lặp lại input), cập nhật vào phiên chưa có actual gần nhất
     last_df = fetch_history_all(10)
     if last_df[(last_df['input'] == input_str) & (last_df['actual'].isnull())].shape[0] > 0:
-        actual = prediction  # Nếu muốn, bạn có thể nhập thực tế khác, ở đây mặc định lấy prediction
+        actual = prediction  # (Ở đây lấy prediction làm actual, muốn linh hoạt thì chỉnh lại)
         update_actual_for_last(input_str, actual)
 
     # Trả lời bằng phân tích lịch sử
