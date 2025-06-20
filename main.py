@@ -173,7 +173,7 @@ def train_and_save_model():
     if total < 200:
         models = [
             ("rf", RandomForestClassifier(n_estimators=100)),
-            ("xgb", XGBoostClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+            ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
             ("lr", LogisticRegression(max_iter=1000))
         ]
     else:
@@ -228,7 +228,7 @@ def train_with_recent_data(n=100):
     if total < 200:
         models = [
             ("rf", RandomForestClassifier(n_estimators=100)),
-            ("xgb", XGBoostClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+            ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
             ("lr", LogisticRegression(max_iter=1000))
         ]
     else:
