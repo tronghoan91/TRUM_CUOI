@@ -12,6 +12,28 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
 
+# ----- BẮT ĐẦU: PHẦN FLASK GIỮ CỔNG -----
+import threading
+from flask import Flask
+
+def start_flask():
+    app = Flask(__name__)
+
+    @app.route('/')
+    def home():
+        return "Bot is alive!", 200
+
+    @app.route('/healthz')
+    def health():
+        return "OK", 200
+
+    # Port 10000 hoặc 8080 đều được, nhưng 10000 là mặc định Render scan
+    app.run(host='0.0.0.0', port=10000)
+
+# Chạy Flask ở thread phụ, không ảnh hưởng bot chính
+threading.Thread(target=start_flask, daemon=True).start()
+# ----- KẾT THÚC: PHẦN FLASK GIỮ CỔNG -----
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MODEL_PATH = os.getenv("MODEL_PATH", "/tmp/sicbo_model.joblib")
