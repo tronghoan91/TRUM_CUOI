@@ -76,16 +76,6 @@ def insert_to_history(input_str, actual, bot_predict=None):
             )
             conn.commit()
 
-def suggest_best_totals(df_with_actual):
-    if df_with_actual.empty:
-        return [11, 12, 13]
-    total_list = [sum(int(x) for x in s.split()) for s in df_with_actual['input']]
-    c = Counter(total_list)
-    common = [k for k, v in c.most_common(3)]
-    if len(common) < 3:
-        common = [11, 12, 13]
-    return common
-
 def analyze_trend_and_predict(df_with_actual):
     note = ""
     prediction = None
@@ -101,23 +91,50 @@ def analyze_trend_and_predict(df_with_actual):
         flip_count = sum([actuals[i]!=actuals[i-1] for i in range(1, len(actuals))])
         flip_rate = flip_count/(len(actuals)-1) if len(actuals)>1 else 0
         acc = sum(df_with_actual['bot_predict']==df_with_actual['actual'])/len(df_with_actual) if 'bot_predict' in df_with_actual else 0
-        if acc < 0.48 or flip_rate > 0.75 or (streak <= 2 and acc < 0.52):
+        # Linh hoạt nhưng kiểm soát rủi ro!
+        if acc < 0.48 or flip_rate > 0.8 or (streak <= 1 and acc < 0.5):
             note = "⚠️ Cầu nhiễu, tỉ lệ đúng thấp. Nên nghỉ hoặc chỉ quan sát."
             prediction = None
-        elif streak >= 4:
+        elif streak >= 3:
             note = f"🔥 Trend rõ: {last.upper()} {streak} phiên liên tiếp! Nên theo trend này."
             prediction = last
+        elif acc >= 0.5 and flip_rate < 0.8:
+            note = "💡 Cầu bình thường, có thể vào nhẹ thăm dò theo xác suất gần đây."
+            prediction = "Tài" if df_with_actual['actual'].value_counts().get("Tài", 0) >= df_with_actual['actual'].value_counts().get("Xỉu", 0) else "Xỉu"
         else:
-            note = "Cầu bình thường, chưa rõ trend mạnh, vào nhẹ hoặc quan sát."
+            note = "Chưa đủ dữ liệu thực tế để phân tích trend."
             prediction = None
     else:
         note = "Chưa đủ dữ liệu thực tế để phân tích trend."
         prediction = None
     return prediction, note
 
-def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note):
+def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min_ratio=0.5):
+    if prediction not in ("Tài", "Xỉu") or df_with_actual.empty:
+        return [], "Không có dự đoán, không nên đánh dải tổng."
+    recent = df_with_actual.tail(n_last)
+    totals = [sum(int(x) for x in s.split()) for s in recent['input']]
+    if prediction == "Tài":
+        eligible = [t for t in range(11, 19)]
+    else:
+        eligible = [t for t in range(3, 11)]
+    total_counts = Counter([t for t in totals if t in eligible])
+    if not total_counts:
+        return [], "Cầu tổng quá nhiễu, không nên đánh tổng phiên này."
+    sorted_totals = [t for t, _ in total_counts.most_common()]
+    # Cộng xác suất cho tới khi đủ min_ratio
+    cumulative, dsum, best = 0, sum(total_counts.values()), []
+    for t in sorted_totals:
+        cumulative += total_counts[t]
+        best.append(t)
+        if dsum and cumulative / dsum >= min_ratio:
+            break
+    if len(best) < 2:
+        return [], "⚠️ Cầu tổng đang out trend, không nên đánh tổng phiên này."
+    return sorted(best), ""
+
+def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note):
     tong = len(df_all)
-    # Chỉ thống kê các phiên bot thực sự dự đoán (Tài/Xỉu)
     df_predict = df_with_actual[df_with_actual['bot_predict'].isin(["Tài", "Xỉu"])]
     so_du_doan = len(df_predict)
     dung = sum(df_predict['bot_predict'] == df_predict['actual'])
@@ -128,7 +145,8 @@ def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note):
         f"Số phiên đã lưu: {tong}\n"
         f"Số phiên đã dự đoán (Tài/Xỉu): {so_du_doan} (Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%)\n"
         f"Dự đoán phiên này: {prediction or '-'}\n"
-        f"Dải tổng nên đánh: {', '.join(str(x) for x in best_totals)}\n"
+        f"Dải tổng nên đánh: {', '.join(str(x) for x in best_totals) if best_totals else '-'}\n"
+        f"{total_note}\n"
         f"{trend_note}"
     )
     return msg
@@ -162,8 +180,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Thống kê lại sau khi thêm
         df_all = fetch_history_all(10000)
         df_with_actual = df_all[df_all['actual'].notnull()]
-        best_totals = suggest_best_totals(df_with_actual) if not df_with_actual.empty else [11,12,13]
-        msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note)
+        best_totals, total_note = suggest_best_totals_by_prediction(df_with_actual, prediction)
+        msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note)
         await update.message.reply_text(msg)
         return
 
@@ -189,8 +207,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_all = fetch_history_all(10000)
     df_with_actual = df_all[df_all['actual'].notnull()]
     prediction, trend_note = analyze_trend_and_predict(df_with_actual)
-    best_totals = suggest_best_totals(df_with_actual) if not df_with_actual.empty else [11,12,13]
-    msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note)
+    best_totals, total_note = suggest_best_totals_by_prediction(df_with_actual, prediction)
+    msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note)
     await update.message.reply_text(msg)
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
