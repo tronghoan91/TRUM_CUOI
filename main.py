@@ -45,7 +45,6 @@ MIN_ACCURACY = 0.5
 WINDOW_SIZE = 40
 FEATURE_WINDOW = 3  # Số phiên gần nhất dùng làm feature
 
-# --- Tối ưu tốc độ retrain ---
 RETRAIN_EVERY_N = 10
 retrain_counter = 0
 
@@ -57,7 +56,6 @@ def get_db_conn():
 def create_table():
     with get_db_conn() as conn:
         with conn.cursor() as cur:
-            # Tạo bảng nếu chưa có
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS history (
                     id SERIAL PRIMARY KEY,
@@ -65,7 +63,6 @@ def create_table():
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # Thêm cột 'prediction' nếu chưa có
             cur.execute("""
                 DO $$
                 BEGIN
@@ -77,7 +74,6 @@ def create_table():
                     END IF;
                 END$$;
             """)
-            # Thêm cột 'actual' nếu chưa có
             cur.execute("""
                 DO $$
                 BEGIN
@@ -100,7 +96,7 @@ def insert_to_db(numbers, prediction, actual=None):
             )
             conn.commit()
 
-def fetch_history(limit=500, with_actual=True):
+def fetch_history(limit=10000, with_actual=True):
     with get_db_conn() as conn:
         query = "SELECT id, input, prediction, actual, created_at FROM history"
         if with_actual:
@@ -111,7 +107,7 @@ def fetch_history(limit=500, with_actual=True):
 
 def extract_features(nums):
     features = []
-    features.extend(nums)  # 3 số gốc
+    features.extend(nums)
     features.append(sum(nums))
     features.append(max(nums))
     features.append(min(nums))
@@ -120,17 +116,15 @@ def extract_features(nums):
     features.append(1 if len(set(nums)) == 1 else 0)  # bão
     features.append(1 if sum(nums) % 2 == 0 else 0)   # chẵn lẻ
     features.append(1 if sum(nums) >= 11 else 0)      # tài/xỉu
-    # Feature bổ sung:
-    features.append(nums[0] + nums[1])  # Tổng 2 số đầu
-    features.append(nums[1] + nums[2])  # Tổng 2 số cuối
-    features.append(abs(nums[0] - nums[2]))  # Độ lệch đầu-cuối
+    features.append(nums[0] + nums[1])
+    features.append(nums[1] + nums[2])
+    features.append(abs(nums[0] - nums[2]))
     return features
 
 def get_window_features(history_inputs):
     features = []
     for nums in history_inputs:
         features += extract_features(nums)
-    # Fill 0 nếu thiếu data
     for _ in range(FEATURE_WINDOW - len(history_inputs)):
         features += [0] * len(extract_features([0,0,0]))
     return features
@@ -169,7 +163,6 @@ def train_and_save_model():
         X.append(get_window_features(history_inputs))
         y.append(df.iloc[i]["actual"])
 
-    # Dưới 200 phiên chỉ dùng 3 model mạnh nhất, trên 200 dùng đủ 6 model
     if total < 200:
         models = [
             ("rf", RandomForestClassifier(n_estimators=100)),
@@ -362,7 +355,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global retrain_counter
     text = update.message.text.strip()
 
-    # Check nhập nhầm, nhập lặp (so với phiên trước)
     df_hist_check = fetch_history(1, with_actual=False)
     if df_hist_check.shape[0] > 0:
         last_input_str = df_hist_check.iloc[0]["input"]
@@ -376,7 +368,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Bạn vừa nhập kết quả này ở phiên trước. Nếu nhập nhầm, gửi lại đúng kết quả mới!")
             return
 
-    # Chuẩn hóa input: '123' hoặc '1 2 3'
     if re.match(r"^\d{3}$", text):
         numbers = [int(x) for x in text]
         input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
@@ -387,7 +378,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Vui lòng nhập 3 số liền nhau (VD: 345) hoặc 3 số cách nhau bằng dấu cách (VD: 3 4 5).")
         return
 
-    # Gán nhãn thực tế cho lượt chơi trước đó (nếu có)
     last_entry = None
     with get_db_conn() as conn:
         with conn.cursor() as cur:
@@ -408,7 +398,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             retrain_needed = True
             retrain_counter = 0
 
-    # Phát hiện đổi thuật toán
     algo_changed = detect_algo_change()
     if algo_changed:
         await update.message.reply_text(
@@ -417,7 +406,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         retrain_needed = True
         retrain_counter = 0
 
-    # Lấy các phiên trước cho feature chuỗi
     df_hist = fetch_history(FEATURE_WINDOW-1, with_actual=False)
     prev_inputs = []
     if not df_hist.empty:
@@ -428,10 +416,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_total = load_total_model()
     input_data = numbers
 
-    # Lấy xác suất từng tổng từ model multi-class
     prob_dict = predict_total_prob(model_total, input_data, prev_inputs) if model_total else {}
     best_totals = suggest_best_totals_any(prob_dict, top_n=3) if prob_dict else []
-    # Dự đoán tài/xỉu, chẵn/lẻ của tổng xác suất cao nhất
     if best_totals:
         top_total = best_totals[0]
         prediction = "Tài" if top_total >= 11 else "Xỉu"
@@ -444,7 +430,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     insert_to_db(input_str, prediction, actual=None)
     stats = calculate_stats()
-    # Chuỗi thắng/thua và trend ngắn
     df_stats = fetch_history(15)
     streak, last, trend_type = get_streak_stats(df_stats, n=5)
     trend = ""
@@ -455,7 +440,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif stats['accuracy'] <= 55:
         trend = "Sóng nhiễu, nên cân nhắc quan sát thêm."
 
-    # Dự báo bão
     bao_warn = ""
     if bao_model and len(set(input_data)) != 1:
         bao_prob = predict_bao_prob(bao_model, input_data, prev_inputs)
@@ -475,7 +459,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(response.strip())
 
-    # ==== RETRAIN SAU KHI ĐÃ TRẢ LỜI USER (nếu cần) ====
     if retrain_needed:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, train_and_save_model)
@@ -493,7 +476,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=open(path, "rb"), filename=f"sicbo_history_backup_{now_str}.csv")
 
 def calculate_stats():
-    df = fetch_history(50)
+    df = fetch_history(100000)  # THỐNG KÊ TRÊN TOÀN BỘ LỊCH SỬ ACTUAL
     correct = sum(df['prediction'] == df['actual'])
     total = len(df)
     wrong = total - correct
