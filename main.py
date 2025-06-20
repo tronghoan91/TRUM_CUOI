@@ -36,6 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MODEL_PATH = os.getenv("MODEL_PATH", "/tmp/sicbo_model.joblib")
 BAO_MODEL_PATH = os.getenv("BAO_MODEL_PATH", "/tmp/bao_model.joblib")
+TOTAL_MODEL_PATH = os.getenv("TOTAL_MODEL_PATH", "/tmp/total_model.joblib")
 
 MIN_ACCURACY = 0.5
 WINDOW_SIZE = 40
@@ -211,6 +212,53 @@ def predict_bao_prob(model, input_data, prev_inputs):
     prob = model.predict_proba(X)[0][1]
     return prob
 
+# ====== Model multi-class dự đoán tổng ======
+def train_total_model():
+    df = fetch_history(2000)
+    if df.empty or len(df) < 50:
+        return None
+    X, y = [], []
+    for i in range(len(df)):
+        history_inputs = []
+        for j in range(FEATURE_WINDOW):
+            if i-j < 0: continue
+            nums = [int(x) for x in df.iloc[i-j]["input"].split()]
+            history_inputs.insert(0, nums)
+        X.append(get_window_features(history_inputs))
+        label = sum([int(x) for x in df.iloc[i]["input"].split()])
+        y.append(label)
+    model = RandomForestClassifier(n_estimators=80)
+    model.fit(X, y)
+    dump(model, TOTAL_MODEL_PATH)
+    return model
+
+def load_total_model():
+    if os.path.exists(TOTAL_MODEL_PATH):
+        return load(TOTAL_MODEL_PATH)
+    return train_total_model()
+
+def predict_total_prob(model, input_data, prev_inputs):
+    history_inputs = prev_inputs[-(FEATURE_WINDOW-1):] + [input_data]
+    features = get_window_features(history_inputs)
+    X = np.array([features])
+    probs = model.predict_proba(X)[0]
+    classes = model.classes_
+    prob_dict = {cls: prob for cls, prob in zip(classes, probs)}
+    return prob_dict
+
+def suggest_best_totals(prob_dict, predict_label, parity=None, top_n=3):
+    if predict_label == "Tài":
+        candidate_totals = [i for i in range(11, 18)]
+    else:
+        candidate_totals = [i for i in range(4, 11)]
+    if parity == "Chẵn":
+        candidate_totals = [i for i in candidate_totals if i % 2 == 0]
+    elif parity == "Lẻ":
+        candidate_totals = [i for i in candidate_totals if i % 2 == 1]
+    ranked = sorted(candidate_totals, key=lambda x: prob_dict.get(x, 0), reverse=True)
+    return ranked[:top_n]
+# ===========================================
+
 def get_last_play_time():
     df = fetch_history(1, with_actual=False)
     if df.empty:
@@ -226,7 +274,7 @@ def time_diff_message(last_time):
         return ("⚠️ Đã lâu bạn chưa nhập kết quả thực tế vào bot. Kết quả dự đoán chỉ mang tính tham khảo.")
     return ""
 
-def generate_response(prediction, input_text, stats, time_msg, explain_msg="", bao_warn=""):
+def generate_response(prediction, input_text, stats, time_msg, explain_msg="", bao_warn="", range_msg=""):
     nums = list(map(int, input_text.split()))
     total = sum(nums)
     tai_xiu = "Tài" if total >= 11 else "Xỉu"
@@ -238,6 +286,7 @@ def generate_response(prediction, input_text, stats, time_msg, explain_msg="", b
         f"{bao}\n"
         f"{explain_msg}\n"
         f"{bao_warn}\n"
+        f"{range_msg}\n"
         f"✔️ Đúng: {stats['correct']} | ❌ Sai: {stats['wrong']} | 🎯 {stats['accuracy']}%"
     )
     if time_msg:
@@ -315,12 +364,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn2.commit()
         train_and_save_model()
         train_bao_model()
+        train_total_model()
 
     # Phát hiện đổi thuật toán
     algo_changed = detect_algo_change()
     if algo_changed:
         train_with_recent_data(WINDOW_SIZE * 2)
         train_bao_model()
+        train_total_model()
         await update.message.reply_text(
             f"⚠️ BOT phát hiện tỉ lệ dự đoán đúng giảm mạnh! Game có thể đã đổi thuật toán. BOT sẽ tự động học lại sóng mới."
         )
@@ -333,6 +384,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     model = load_model()
     bao_model = load_bao_model()
+    model_total = load_total_model()
     input_data = numbers
     if model is not None:
         prediction, features = predict_with_model(model, input_data, prev_inputs)
@@ -352,7 +404,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bao_prob > 0.08:
             bao_warn = f"⚡️ Dự báo: Phiên tiếp theo có khả năng xuất hiện BÃO bất thường! (Xác suất ~{bao_prob:.1%})"
 
-    response = generate_response(prediction, input_str, stats, time_msg, explain_msg, bao_warn)
+    # Đề xuất dải tổng nên đánh (bằng model xác suất tổng)
+    chan_le = "Chẵn" if sum(input_data) % 2 == 0 else "Lẻ"
+    range_msg = ""
+    if model_total is not None:
+        prob_dict = predict_total_prob(model_total, input_data, prev_inputs)
+        best_totals = suggest_best_totals(prob_dict, prediction, parity=chan_le)
+        if best_totals:
+            range_msg = f"🎯 Dải tổng {prediction.lower()} nên đánh ({chan_le.lower()}): " + ", ".join(str(t) for t in best_totals)
+
+    response = generate_response(prediction, input_str, stats, time_msg, explain_msg, bao_warn, range_msg)
     if stats['correct'] + stats['wrong'] < 15:
         response += "\n⚠️ Dữ liệu còn ít, chỉ nên tham khảo!"
     await update.message.reply_text(response)
@@ -362,7 +423,6 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if df.empty:
         await update.message.reply_text("⚠️ Không có dữ liệu để backup.")
         return
-    from datetime import datetime
     now_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
     path = f"/tmp/sicbo_history_backup_{now_str}.csv"
     df.to_csv(path, index=False)
