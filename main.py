@@ -66,13 +66,25 @@ def get_history_count():
             cur.execute("SELECT COUNT(*) FROM history")
             return cur.fetchone()[0]
 
-def insert_to_history(input_str, actual, bot_predict=None):
+def insert_prediction_only(prediction):
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO history (input, actual, bot_predict, created_at) VALUES (%s, %s, %s, %s)",
-                (input_str, actual, bot_predict, datetime.now())
+                "INSERT INTO history (bot_predict, created_at) VALUES (%s, %s)",
+                (prediction, datetime.now())
             )
+            conn.commit()
+
+def update_last_prediction_with_result(input_str, actual):
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            # Cập nhật vào dòng cuối cùng chưa có actual
+            cur.execute("""
+                UPDATE history
+                SET input = %s, actual = %s
+                WHERE actual IS NULL
+                ORDER BY id DESC LIMIT 1
+            """, (input_str, actual))
             conn.commit()
 
 def analyze_trend_and_predict(df_with_actual):
@@ -115,7 +127,7 @@ def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min
     if prediction not in ("Tài", "Xỉu") or df_with_actual.empty:
         return [], "Không có dự đoán, không nên đánh dải tổng."
     recent = df_with_actual.tail(n_last)
-    totals = [sum(int(x) for x in s.split()) for s in recent['input']]
+    totals = [sum(int(x) for x in s.split()) for s in recent['input'] if s]
     if prediction == "Tài":
         eligible = [t for t in range(11, 19)]
     else:
@@ -124,7 +136,6 @@ def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min
     if not total_counts:
         return [], "Cầu tổng quá nhiễu, không nên đánh tổng phiên này."
     sorted_totals = [t for t, _ in total_counts.most_common()]
-    # Cộng xác suất cho tới khi đủ min_ratio
     cumulative, dsum, best = 0, sum(total_counts.values()), []
     for t in sorted_totals:
         cumulative += total_counts[t]
@@ -137,16 +148,17 @@ def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min
 
 def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note):
     tong = len(df_all)
-    df_predict = df_with_actual[df_with_actual['bot_predict'].isin(["Tài", "Xỉu"])]
-    so_du_doan = len(df_predict)
-    dung = sum(df_predict['bot_predict'] == df_predict['actual'])
+    # Thống kê chỉ tính các dòng có cả actual và bot_predict (tức là đã có dự đoán trước đó và đã nhập kết quả thực tế)
+    df_stat = df_all[df_all['actual'].notnull() & df_all['bot_predict'].notnull()]
+    so_du_doan = len(df_stat)
+    dung = sum(df_stat['bot_predict'] == df_stat['actual'])
     sai = so_du_doan - dung
     tile = round((dung/so_du_doan)*100, 2) if so_du_doan else 0
 
     msg = (
         f"Số phiên đã lưu: {tong}\n"
         f"Số phiên đã dự đoán (Tài/Xỉu): {so_du_doan} (Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%)\n"
-        f"Dự đoán phiên này: {prediction or '-'}\n"
+        f"Dự đoán phiên kế tiếp: {prediction or '-'}\n"
         f"Dải tổng nên đánh: {', '.join(str(x) for x in best_totals) if best_totals else '-'}\n"
         f"{total_note}\n"
         f"{trend_note}"
@@ -170,20 +182,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = sum(numbers)
         actual = "Tài" if total >= 11 else "Xỉu"
 
-        # Lấy lịch sử trước khi insert
+        # Update actual cho dòng cuối chưa có actual
+        update_last_prediction_with_result(input_str, actual)
+
+        # Fetch lại lịch sử đã đầy đủ actual để phân tích dự đoán cho phiên tiếp theo
         df_all = fetch_history_all(10000)
         df_with_actual = df_all[df_all['actual'].notnull()]
 
-        # Phân tích trend và quyết định prediction linh động
+        # Phân tích trend và dự đoán cho phiên kế tiếp
         prediction, trend_note = analyze_trend_and_predict(df_with_actual)
-        # Nếu bot quyết định dự đoán thì ghi vào cột bot_predict
-        insert_to_history(input_str, actual, prediction)
+        # Lưu prediction này vào dòng mới (chưa có actual), dùng cho lần nhập tiếp theo
+        insert_prediction_only(prediction)
 
-        # Thống kê lại sau khi thêm
+        # Thống kê lại
         df_all = fetch_history_all(10000)
         df_with_actual = df_all[df_all['actual'].notnull()]
         best_totals, total_note = suggest_best_totals_by_prediction(df_with_actual, prediction)
-        msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note)
+
+        msg = (
+            f"✔️ Kết quả thực tế phiên vừa nhập: {actual} (tổng: {total})\n"
+            + reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note)
+        )
         await update.message.reply_text(msg)
         return
 
