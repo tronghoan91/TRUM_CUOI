@@ -142,7 +142,8 @@ def train_and_save_model():
     if df.empty:
         return None
     df = df[df["actual"].notnull()]
-    if len(df) < 10:
+    if len(df) < 30:
+        print("Not enough data to train model. Need at least 30 rows.")
         return None
     X, y = [], []
     for i in range(len(df)):
@@ -188,7 +189,8 @@ def detect_algo_change():
 def train_with_recent_data(n=100):
     df = fetch_history(n)
     df = df[df["actual"].notnull()]
-    if len(df) < 10:
+    if len(df) < 30:
+        print("Not enough data for LightGBM!")
         return None
     X, y = [], []
     for i in range(len(df)):
@@ -215,7 +217,7 @@ def train_with_recent_data(n=100):
 
 def train_bao_model():
     df = fetch_history(2000)
-    if df.empty or len(df) < 20:
+    if df.empty or len(df) < 30:
         return None
     X, y = [], []
     for i in range(len(df)):
@@ -242,8 +244,15 @@ def predict_bao_prob(model, input_data, prev_inputs):
     history_inputs = prev_inputs[-(FEATURE_WINDOW-1):] + [input_data]
     features = get_window_features(history_inputs)
     X = np.array([features])
-    prob = model.predict_proba(X)[0][1]
-    return prob
+    proba = model.predict_proba(X)[0]
+    classes = model.classes_
+    if len(classes) == 2:
+        class_idx_1 = np.where(classes == 1)[0][0]
+        return proba[class_idx_1]
+    elif len(classes) == 1:
+        return 1.0 if classes[0] == 1 else 0.0
+    else:
+        return 0.0
 
 def train_total_model():
     df = fetch_history(2000)
