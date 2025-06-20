@@ -7,11 +7,13 @@ from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 from joblib import dump, load
 import psycopg2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 from flask import Flask
 
@@ -55,7 +57,6 @@ def create_table():
                 CREATE TABLE IF NOT EXISTS history (
                     id SERIAL PRIMARY KEY,
                     input TEXT,
-                    actual TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
@@ -68,6 +69,18 @@ def create_table():
                         WHERE table_name='history' AND column_name='prediction'
                     ) THEN
                         ALTER TABLE history ADD COLUMN prediction TEXT;
+                    END IF;
+                END$$;
+            """)
+            # Thêm cột 'actual' nếu chưa có
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='history' AND column_name='actual'
+                    ) THEN
+                        ALTER TABLE history ADD COLUMN actual TEXT;
                     END IF;
                 END$$;
             """)
@@ -102,6 +115,10 @@ def extract_features(nums):
     features.append(1 if len(set(nums)) == 1 else 0)  # bão
     features.append(1 if sum(nums) % 2 == 0 else 0)   # chẵn lẻ
     features.append(1 if sum(nums) >= 11 else 0)      # tài/xỉu
+    # Feature bổ sung:
+    features.append(nums[0] + nums[1])  # Tổng 2 số đầu
+    features.append(nums[1] + nums[2])  # Tổng 2 số cuối
+    features.append(abs(nums[0] - nums[2]))  # Độ lệch đầu-cuối
     return features
 
 def get_window_features(history_inputs):
@@ -110,7 +127,7 @@ def get_window_features(history_inputs):
         features += extract_features(nums)
     # Fill 0 nếu thiếu data
     for _ in range(FEATURE_WINDOW - len(history_inputs)):
-        features += [0] * 10
+        features += [0] * len(extract_features([0,0,0]))
     return features
 
 def label_func(nums):
@@ -121,7 +138,7 @@ def is_bao(nums):
     return int(len(set(nums)) == 1)
 
 def train_and_save_model():
-    df = fetch_history(2000)
+    df = fetch_history(5000)
     if df.empty:
         return None
     df = df[df["actual"].notnull()]
@@ -140,6 +157,8 @@ def train_and_save_model():
     models = [
         ("rf", RandomForestClassifier(n_estimators=100)),
         ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+        ("lgb", LGBMClassifier(n_estimators=100)),
+        ("cat", CatBoostClassifier(verbose=0, iterations=100)),
         ("mlp", MLPClassifier(max_iter=2000)),
         ("lr", LogisticRegression(max_iter=1000))
     ]
@@ -184,6 +203,8 @@ def train_with_recent_data(n=100):
     models = [
         ("rf", RandomForestClassifier(n_estimators=100)),
         ("xgb", XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="mlogloss")),
+        ("lgb", LGBMClassifier(n_estimators=100)),
+        ("cat", CatBoostClassifier(verbose=0, iterations=100)),
         ("mlp", MLPClassifier(max_iter=2000)),
         ("lr", LogisticRegression(max_iter=1000))
     ]
@@ -224,7 +245,6 @@ def predict_bao_prob(model, input_data, prev_inputs):
     prob = model.predict_proba(X)[0][1]
     return prob
 
-# ====== Model multi-class dự đoán tổng ======
 def train_total_model():
     df = fetch_history(2000)
     if df.empty or len(df) < 50:
@@ -263,7 +283,6 @@ def suggest_best_totals_any(prob_dict, top_n=3):
     return ranked[:top_n]
 
 def get_streak_stats(df, n=5):
-    # Trả về chuỗi thắng/thua, số phiên gần nhất
     results = (df['prediction'] == df['actual']).tolist()
     if not results:
         return 0, 0, ''
@@ -295,6 +314,12 @@ def get_trend_msg(stats, streak, last, trend, bao_warn):
         msg += " Đặc biệt chú ý khả năng bão!"
     return msg
 
+def get_total_history_count():
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM history WHERE actual IS NOT NULL")
+            return cur.fetchone()[0]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Gửi 3 số kết quả gần nhất để nhận dự đoán (ví dụ: 456 hoặc 4 5 6). Gõ /backup để xuất lịch sử ra file."
@@ -307,7 +332,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_hist_check = fetch_history(1, with_actual=False)
     if df_hist_check.shape[0] > 0:
         last_input_str = df_hist_check.iloc[0]["input"]
-        # Chuẩn hóa input hiện tại về dạng 3 số cách nhau
         if re.match(r"^\d{3}$", text):
             this_input = f"{text[0]} {text[1]} {text[2]}"
         elif re.match(r"^\d+ \d+ \d+$", text):
@@ -330,6 +354,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Gán nhãn thực tế cho lượt chơi trước đó (nếu có)
+    last_entry = None
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id, input FROM history WHERE actual IS NULL ORDER BY id DESC LIMIT 1")
@@ -344,6 +369,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         train_and_save_model()
         train_bao_model()
         train_total_model()
+        total = get_total_history_count()
+        await update.message.reply_text(f"✅ Đã ghi nhận kết quả thực tế phiên mới. Tổng số phiên đã ghi nhận: {total}")
 
     # Phát hiện đổi thuật toán
     algo_changed = detect_algo_change()
@@ -375,7 +402,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prediction = "Tài" if top_total >= 11 else "Xỉu"
         chan_le = "Chẵn" if top_total % 2 == 0 else "Lẻ"
     else:
-        # Fallback nếu chưa có dữ liệu
         top_total = sum(numbers)
         prediction = "Tài" if top_total >= 11 else "Xỉu"
         chan_le = "Chẵn" if top_total % 2 == 0 else "Lẻ"
@@ -401,7 +427,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bao_prob > 0.08:
             bao_warn = "⚡️ Dự báo: Phiên tiếp theo có khả năng xuất hiện BÃO!"
 
-    # Sinh câu trả lời linh động
     trend_msg = get_trend_msg(stats, streak, last, trend, bao_warn)
 
     response = (
