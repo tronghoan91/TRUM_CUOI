@@ -39,6 +39,12 @@ def fetch_history(limit=10000):
         df = pd.read_sql(query, conn, params=(limit,))
     return df
 
+def get_history_count():
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM history WHERE actual IS NOT NULL")
+            return cur.fetchone()[0]
+
 def bot_smart_reply(df, best_totals, prediction=None):
     total = len(df)
     correct = sum(df['prediction'] == df['actual'])
@@ -132,6 +138,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Các lệnh bạn có thể dùng:\n"
         "/start - Xem giới thiệu và lệnh\n"
         "/stats - Xem thống kê dữ liệu, chuỗi thắng/thua, flip rate\n"
+        "/count - Đếm tổng số phiên đã nhập và lưu\n"
         "/reset - Reset toàn bộ lịch sử (Cẩn thận, không thể khôi phục)\n"
         "/backup - Xuất file lịch sử ra CSV\n"
         "Hoặc chỉ cần gửi bất kỳ tin nhắn nào để nhận dự đoán, phân tích, tổng nên đánh!"
@@ -145,6 +152,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"Lỗi: {e}"
     await update.message.reply_text(msg)
 
+async def count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        count = get_history_count()
+        await update.message.reply_text(f"Đã có tổng cộng {count} phiên dữ liệu được lưu.")
+    except Exception as e:
+        await update.message.reply_text(f"Lỗi: {e}")
+
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000)
     if df.empty:
@@ -155,13 +169,11 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df.to_csv(path, index=False)
     await update.message.reply_document(document=open(path, "rb"), filename=f"sicbo_history_backup_{now_str}.csv")
 
-# Xác nhận reset
 reset_confirm = {}
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if reset_confirm.get(user_id):
-        # Tiến hành xóa
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM history")
@@ -179,6 +191,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("count", count))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
