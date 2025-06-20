@@ -45,7 +45,6 @@ def create_table():
             conn.commit()
 
 def alter_table_add_column_bot_predict():
-    # An toàn, không lỗi nếu đã có cột
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE history ADD COLUMN IF NOT EXISTS bot_predict TEXT;")
@@ -91,22 +90,25 @@ def analyze_trend_and_predict(df_with_actual):
         flip_count = sum([actuals[i]!=actuals[i-1] for i in range(1, len(actuals))])
         flip_rate = flip_count/(len(actuals)-1) if len(actuals)>1 else 0
         acc = sum(df_with_actual['bot_predict']==df_with_actual['actual'])/len(df_with_actual) if 'bot_predict' in df_with_actual else 0
-        # Linh hoạt nhưng kiểm soát rủi ro!
-        if acc < 0.48 or flip_rate > 0.8 or (streak <= 1 and acc < 0.5):
-            note = "⚠️ Cầu nhiễu, tỉ lệ đúng thấp. Nên nghỉ hoặc chỉ quan sát."
+
+        if streak >= 5:
+            note = f"⚠️ Trend {last.upper()} đã kéo dài {streak} phiên – NGUY CƠ ĐẢO CẦU RẤT CAO, nên vào nhẹ đảo cầu hoặc tránh phiên này."
+            prediction = "Xỉu" if last == "Tài" else "Tài"
+        elif acc < 0.43 and flip_rate > 0.88:
+            note = "⚠️ Cầu cực nhiễu, tỉ lệ đúng thấp, nên nghỉ hoặc vào cực nhẹ để dò sóng."
             prediction = None
         elif streak >= 3:
-            note = f"🔥 Trend rõ: {last.upper()} {streak} phiên liên tiếp! Nên theo trend này."
+            note = f"🔥 Trend rõ: {last.upper()} {streak} phiên liên tiếp! Có thể vào mạnh theo trend này."
             prediction = last
-        elif acc >= 0.5 and flip_rate < 0.8:
+        elif acc >= 0.48 and flip_rate < 0.87:
             note = "💡 Cầu bình thường, có thể vào nhẹ thăm dò theo xác suất gần đây."
             prediction = "Tài" if df_with_actual['actual'].value_counts().get("Tài", 0) >= df_with_actual['actual'].value_counts().get("Xỉu", 0) else "Xỉu"
         else:
-            note = "Chưa đủ dữ liệu thực tế để phân tích trend."
-            prediction = None
+            note = "Không có trend rõ, có thể vào nhẹ theo xác suất gốc."
+            prediction = "Tài"
     else:
-        note = "Chưa đủ dữ liệu thực tế để phân tích trend."
-        prediction = None
+        note = "Chưa đủ dữ liệu thực tế, vào nhẹ theo xác suất gốc."
+        prediction = "Tài"
     return prediction, note
 
 def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min_ratio=0.5):
