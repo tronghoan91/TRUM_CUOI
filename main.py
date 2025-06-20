@@ -50,14 +50,26 @@ def get_db_conn():
 def create_table():
     with get_db_conn() as conn:
         with conn.cursor() as cur:
+            # Tạo bảng nếu chưa có
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS history (
                     id SERIAL PRIMARY KEY,
                     input TEXT,
-                    prediction TEXT,
                     actual TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
+            """)
+            # Thêm cột 'prediction' nếu chưa có
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='history' AND column_name='prediction'
+                    ) THEN
+                        ALTER TABLE history ADD COLUMN prediction TEXT;
+                    END IF;
+                END$$;
             """)
             conn.commit()
 
