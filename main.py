@@ -44,6 +44,13 @@ def create_table():
             """)
             conn.commit()
 
+def alter_table_add_column_bot_predict():
+    # An toàn, không lỗi nếu đã có cột
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE history ADD COLUMN IF NOT EXISTS bot_predict TEXT;")
+            conn.commit()
+
 def fetch_history_all(limit=10000):
     with get_db_conn() as conn:
         query = """
@@ -131,6 +138,7 @@ reset_confirm = {}
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     create_table()
+    alter_table_add_column_bot_predict()
     m = re.match(r"^(\d{3})$", text)
     m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
     if m or m2:
@@ -177,6 +185,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     create_table()
+    alter_table_add_column_bot_predict()
     df_all = fetch_history_all(10000)
     df_with_actual = df_all[df_all['actual'].notnull()]
     prediction, trend_note = analyze_trend_and_predict(df_with_actual)
@@ -186,6 +195,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     create_table()
+    alter_table_add_column_bot_predict()
     df = fetch_history_all(10000)
     if df.empty:
         await update.message.reply_text("Không có dữ liệu để backup.")
@@ -214,11 +224,13 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     create_table()
+    alter_table_add_column_bot_predict()
     count = get_history_count()
     await update.message.reply_text(f"Đã có tổng cộng {count} phiên dữ liệu được lưu.")
 
 def main():
     create_table()
+    alter_table_add_column_bot_predict()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
