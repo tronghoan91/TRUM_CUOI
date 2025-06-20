@@ -246,74 +246,41 @@ def predict_total_prob(model, input_data, prev_inputs):
     prob_dict = {cls: prob for cls, prob in zip(classes, probs)}
     return prob_dict
 
-def suggest_best_totals(prob_dict, predict_label, parity=None, top_n=3):
-    if predict_label == "Tài":
-        candidate_totals = [i for i in range(11, 18)]
-    else:
-        candidate_totals = [i for i in range(4, 11)]
-    if parity == "Chẵn":
-        candidate_totals = [i for i in candidate_totals if i % 2 == 0]
-    elif parity == "Lẻ":
-        candidate_totals = [i for i in candidate_totals if i % 2 == 1]
-    ranked = sorted(candidate_totals, key=lambda x: prob_dict.get(x, 0), reverse=True)
+def suggest_best_totals_any(prob_dict, top_n=3):
+    ranked = sorted(prob_dict.keys(), key=lambda x: prob_dict[x], reverse=True)
     return ranked[:top_n]
-# ===========================================
 
-def get_last_play_time():
-    df = fetch_history(1, with_actual=False)
-    if df.empty:
-        return None
-    return df["created_at"].iloc[0]
-
-def time_diff_message(last_time):
-    if last_time is None:
-        return ""
-    now = datetime.now(last_time.tzinfo)
-    diff = now - last_time
-    if diff > timedelta(hours=4):
-        return ("⚠️ Đã lâu bạn chưa nhập kết quả thực tế vào bot. Kết quả dự đoán chỉ mang tính tham khảo.")
-    return ""
-
-def generate_response(prediction, input_text, stats, time_msg, explain_msg="", bao_warn="", range_msg=""):
-    nums = list(map(int, input_text.split()))
-    total = sum(nums)
-    tai_xiu = "Tài" if total >= 11 else "Xỉu"
-    chan_le = "Chẵn" if total % 2 == 0 else "Lẻ"
-    bao = "🎲 BÃO! Ba số giống nhau!" if len(set(nums)) == 1 else ""
-    response = (
-        f"🎯 {prediction}\n"
-        f"🔢 Tổng: {total} ({tai_xiu} - {chan_le})\n"
-        f"{bao}\n"
-        f"{explain_msg}\n"
-        f"{bao_warn}\n"
-        f"{range_msg}\n"
-        f"✔️ Đúng: {stats['correct']} | ❌ Sai: {stats['wrong']} | 🎯 {stats['accuracy']}%"
-    )
-    if time_msg:
-        response += f"\n{time_msg}"
-    return response.strip()
-
-def calculate_stats():
-    df = fetch_history(50)
-    correct = sum(df['prediction'] == df['actual'])
-    total = len(df)
-    wrong = total - correct
-    acc = round(correct / total * 100, 2) if total > 0 else 0
-    return {"correct": correct, "wrong": wrong, "accuracy": acc}
-
-def explain_prediction(features, input_data, prev_inputs):
-    last_sum = sum(input_data)
-    if last_sum >= 11:
-        xu_huong = "Tổng cao"
-    else:
-        xu_huong = "Tổng thấp"
-    msg = f"📈 {xu_huong}"
-    if prev_inputs:
-        prev_tai = sum(1 for nums in prev_inputs if sum(nums) >= 11)
-        if prev_tai > len(prev_inputs)//2:
-            msg += ", gần đây đa phần ra Tài."
+def get_streak_stats(df, n=5):
+    # Trả về chuỗi thắng/thua, số phiên gần nhất
+    results = (df['prediction'] == df['actual']).tolist()
+    if not results:
+        return 0, 0, ''
+    streak = 1
+    last = results[0]
+    for res in results[1:]:
+        if res == last:
+            streak += 1
         else:
-            msg += ", gần đây đa phần ra Xỉu."
+            break
+    return streak, last, "thắng" if last else "thua"
+
+def get_trend_msg(stats, streak, last, trend, bao_warn):
+    if stats['accuracy'] >= 75:
+        msg = "🔥 Sóng đang rất đẹp, đừng bỏ lỡ cơ hội!"
+    elif stats['accuracy'] >= 62:
+        msg = "✅ Cầu đang ổn định, có thể tự tin vào tiền."
+    elif stats['accuracy'] >= 55:
+        msg = "⚠️ Sóng dao động, nên vào mức vừa phải, tránh all-in!"
+    else:
+        msg = "⚠️ Sóng nhiễu, hãy cân nhắc quan sát hoặc giảm điểm."
+    if streak >= 3 and last:
+        msg += f" (Chuỗi thắng {streak} phiên!)"
+    if streak >= 3 and not last:
+        msg += f" (Chuỗi thua {streak} phiên, nên giảm cược hoặc quan sát!)"
+    if trend:
+        msg += f" Xu hướng: {trend}."
+    if bao_warn:
+        msg += " Đặc biệt chú ý khả năng bão!"
     return msg
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -386,37 +353,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bao_model = load_bao_model()
     model_total = load_total_model()
     input_data = numbers
-    if model is not None:
-        prediction, features = predict_with_model(model, input_data, prev_inputs)
+
+    # Lấy xác suất từng tổng từ model multi-class
+    prob_dict = predict_total_prob(model_total, input_data, prev_inputs) if model_total else {}
+    best_totals = suggest_best_totals_any(prob_dict, top_n=3) if prob_dict else []
+    # Dự đoán tài/xỉu, chẵn/lẻ của tổng xác suất cao nhất
+    if best_totals:
+        top_total = best_totals[0]
+        prediction = "Tài" if top_total >= 11 else "Xỉu"
+        chan_le = "Chẵn" if top_total % 2 == 0 else "Lẻ"
     else:
-        prediction = label_func(input_data)
-        features = extract_features(input_data)
+        # Fallback nếu chưa có dữ liệu
+        top_total = sum(numbers)
+        prediction = "Tài" if top_total >= 11 else "Xỉu"
+        chan_le = "Chẵn" if top_total % 2 == 0 else "Lẻ"
+        best_totals = [top_total]
 
     insert_to_db(input_str, prediction, actual=None)
     stats = calculate_stats()
-    time_msg = time_diff_message(get_last_play_time())
-    explain_msg = explain_prediction(features, input_data, prev_inputs)
+    # Chuỗi thắng/thua và trend ngắn
+    df_stats = fetch_history(15)
+    streak, last, trend_type = get_streak_stats(df_stats, n=5)
+    trend = ""
+    if stats['accuracy'] >= 75:
+        trend = f"Sóng mạnh về {prediction}-{chan_le}."
+    elif stats['accuracy'] >= 62:
+        trend = f"Ưu tiên dải {prediction}-{chan_le}."
+    elif stats['accuracy'] <= 55:
+        trend = "Sóng nhiễu, nên cân nhắc quan sát thêm."
 
-    # Dự đoán "bão" phiên tiếp theo: chỉ cảnh báo nếu phiên hiện tại KHÔNG phải bão
+    # Dự báo bão
     bao_warn = ""
     if bao_model and len(set(input_data)) != 1:
         bao_prob = predict_bao_prob(bao_model, input_data, prev_inputs)
         if bao_prob > 0.08:
-            bao_warn = f"⚡️ Dự báo: Phiên tiếp theo có khả năng xuất hiện BÃO bất thường! (Xác suất ~{bao_prob:.1%})"
+            bao_warn = "⚡️ Dự báo: Phiên tiếp theo có khả năng xuất hiện BÃO!"
 
-    # Đề xuất dải tổng nên đánh (bằng model xác suất tổng)
-    chan_le = "Chẵn" if sum(input_data) % 2 == 0 else "Lẻ"
-    range_msg = ""
-    if model_total is not None:
-        prob_dict = predict_total_prob(model_total, input_data, prev_inputs)
-        best_totals = suggest_best_totals(prob_dict, prediction, parity=chan_le)
-        if best_totals:
-            range_msg = f"🎯 Dải tổng {prediction.lower()} nên đánh ({chan_le.lower()}): " + ", ".join(str(t) for t in best_totals)
+    # Sinh câu trả lời linh động
+    trend_msg = get_trend_msg(stats, streak, last, trend, bao_warn)
 
-    response = generate_response(prediction, input_str, stats, time_msg, explain_msg, bao_warn, range_msg)
-    if stats['correct'] + stats['wrong'] < 15:
-        response += "\n⚠️ Dữ liệu còn ít, chỉ nên tham khảo!"
-    await update.message.reply_text(response)
+    response = (
+        f"🎯 Dự đoán: {prediction} - {chan_le}\n"
+        f"🎯 Dải tổng nên đánh: {', '.join(map(str, best_totals))}\n"
+        f"✔️ Đúng: {stats['correct']} | ❌ Sai: {stats['wrong']} | 🎯 {stats['accuracy']}%\n"
+        f"{trend_msg}"
+    )
+    if bao_warn and "BÃO" not in trend_msg:
+        response += f"\n{bao_warn}"
+
+    await update.message.reply_text(response.strip())
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000, with_actual=False)
@@ -427,6 +412,14 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = f"/tmp/sicbo_history_backup_{now_str}.csv"
     df.to_csv(path, index=False)
     await update.message.reply_document(document=open(path, "rb"), filename=f"sicbo_history_backup_{now_str}.csv")
+
+def calculate_stats():
+    df = fetch_history(50)
+    correct = sum(df['prediction'] == df['actual'])
+    total = len(df)
+    wrong = total - correct
+    acc = round(correct / total * 100, 2) if total > 0 else 0
+    return {"correct": correct, "wrong": wrong, "accuracy": acc}
 
 def main():
     create_table()
