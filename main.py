@@ -70,8 +70,8 @@ def insert_prediction_only(prediction):
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO history (bot_predict, created_at) VALUES (%s, %s)",
-                (prediction, datetime.now())
+                "INSERT INTO history (input, bot_predict, created_at) VALUES (%s, %s, %s)",
+                ('', prediction, datetime.now())
             )
             conn.commit()
 
@@ -151,17 +151,20 @@ def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min
 
 def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note):
     tong = len(df_all)
-    df_stat = df_all[df_all['actual'].notnull() & df_all['bot_predict'].notnull()]
+    tong_da_nhap_ket_qua = len(df_with_actual)
+
+    df_stat = df_with_actual[df_with_actual['bot_predict'].notnull()]
     so_du_doan = len(df_stat)
     dung = sum(df_stat['bot_predict'] == df_stat['actual'])
     sai = so_du_doan - dung
-    tile = round((dung/so_du_doan)*100, 2) if so_du_doan else 0
+    tile = round((dung / so_du_doan) * 100, 2) if so_du_doan else 0
 
     msg = (
-        f"Số phiên đã lưu: {tong}\n"
-        f"Số phiên đã dự đoán (Tài/Xỉu): {so_du_doan} (Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%)\n"
-        f"Dự đoán phiên kế tiếp: {prediction or '-'}\n"
-        f"Dải tổng nên đánh: {', '.join(str(x) for x in best_totals) if best_totals else '-'}\n"
+        f"📊 Tổng phiên đã lưu: {tong} | Đã có kết quả: {tong_da_nhap_ket_qua}\n"
+        f"🤖 Bot đã dự đoán: {so_du_doan} phiên\n"
+        f"✅ Đúng: {dung} | ❌ Sai: {sai} | 🎯 Tỉ lệ đúng: {tile}%\n\n"
+        f"📌 Dự đoán phiên kế tiếp: {prediction or '-'}\n"
+        f"🎯 Dải tổng nên đánh: {', '.join(str(x) for x in best_totals) if best_totals else '-'}\n"
         f"{total_note}\n"
         f"{trend_note}"
     )
