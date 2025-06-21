@@ -78,12 +78,15 @@ def insert_prediction_only(prediction):
 def update_last_prediction_with_result(input_str, actual):
     with get_db_conn() as conn:
         with conn.cursor() as cur:
-            # Cập nhật vào dòng cuối cùng chưa có actual
             cur.execute("""
                 UPDATE history
                 SET input = %s, actual = %s
-                WHERE actual IS NULL
-                ORDER BY id DESC LIMIT 1
+                WHERE id = (
+                    SELECT id FROM history
+                    WHERE actual IS NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
             """, (input_str, actual))
             conn.commit()
 
@@ -148,7 +151,6 @@ def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min
 
 def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note):
     tong = len(df_all)
-    # Thống kê chỉ tính các dòng có cả actual và bot_predict (tức là đã có dự đoán trước đó và đã nhập kết quả thực tế)
     df_stat = df_all[df_all['actual'].notnull() & df_all['bot_predict'].notnull()]
     so_du_doan = len(df_stat)
     dung = sum(df_stat['bot_predict'] == df_stat['actual'])
@@ -182,19 +184,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = sum(numbers)
         actual = "Tài" if total >= 11 else "Xỉu"
 
-        # Update actual cho dòng cuối chưa có actual
         update_last_prediction_with_result(input_str, actual)
 
-        # Fetch lại lịch sử đã đầy đủ actual để phân tích dự đoán cho phiên tiếp theo
         df_all = fetch_history_all(10000)
         df_with_actual = df_all[df_all['actual'].notnull()]
-
-        # Phân tích trend và dự đoán cho phiên kế tiếp
         prediction, trend_note = analyze_trend_and_predict(df_with_actual)
-        # Lưu prediction này vào dòng mới (chưa có actual), dùng cho lần nhập tiếp theo
         insert_prediction_only(prediction)
-
-        # Thống kê lại
         df_all = fetch_history_all(10000)
         df_with_actual = df_all[df_all['actual'].notnull()]
         best_totals, total_note = suggest_best_totals_by_prediction(df_with_actual, prediction)
