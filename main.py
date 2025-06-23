@@ -10,6 +10,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 import numpy as np
+from flask import Flask
+import threading
 
 # ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -25,8 +27,24 @@ MODEL_PATH = "ml_stack.joblib"
 if not BOT_TOKEN or not DATABASE_URL:
     raise Exception("Bạn cần set BOT_TOKEN và DATABASE_URL ở biến môi trường!")
 
+# ==== FLASK giữ cổng để tránh sleep ====
+def start_flask():
+    app = Flask(__name__)
+
+    @app.route('/')
+    def home():
+        return "Bot is alive!", 200
+
+    @app.route('/healthz')
+    def health():
+        return "OK", 200
+
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=start_flask, daemon=True).start()
+
+# ==== DB ====
 def create_table():
-    # Kết nối DB và tạo bảng nếu chưa có
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute("""
@@ -54,7 +72,6 @@ def insert_result(input_str, actual):
     conn.close()
 
 def fetch_history(limit=10000):
-    # Dùng pandas và psycopg2, không dùng SQLAlchemy
     conn = psycopg2.connect(DATABASE_URL)
     df = pd.read_sql("SELECT input, actual, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, conn)
     conn.close()
