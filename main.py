@@ -16,11 +16,11 @@ import threading
 # ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MIN_BATCH = 5        # Số kết quả mới tối thiểu để train lại model
-ROLLING_WINDOW = 50  # Window tính rolling xác suất
-PROBA_CUTOFF = 0.62  # Ngưỡng xác suất ưu tiên
-PROBA_ALERT = 0.75   # Ngưỡng cảnh báo mạnh
-BAO_CUTOFF = 0.03    # Ngưỡng cảnh báo bão
+MIN_BATCH = 5
+ROLLING_WINDOW = 50
+PROBA_CUTOFF = 0.62
+PROBA_ALERT = 0.75
+BAO_CUTOFF = 0.03
 
 MODEL_PATH = "ml_stack.joblib"
 
@@ -100,6 +100,10 @@ def train_models(df):
     y_bao = df['bao']
     models = {}
     for key, y in [('tx', y_tx), ('cl', y_cl), ('bao', y_bao)]:
+        if len(set(y)) < 2:
+            # Không đủ 2 class, bỏ qua train, trả None
+            models[key] = None
+            continue
         lr = LogisticRegression().fit(X, y)
         rf = RandomForestClassifier(n_estimators=100).fit(X, y)
         xgbc = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss').fit(X, y)
@@ -112,6 +116,9 @@ def load_models():
     return joblib.load(MODEL_PATH)
 
 def predict_stacking(X_pred, models, key):
+    if models[key] is None:
+        # Trả về xác suất default và cảnh báo
+        return 0.5, [0.5, 0.5, 0.5]
     lr, rf, xgbc = models[key]
     prob_lr = lr.predict_proba(X_pred)[0][1]
     prob_rf = rf.predict_proba(X_pred)[0][1]
@@ -124,7 +131,7 @@ def summary_stats(df):
     if num == 0:
         return 0, 0, 0, 0
     so_du_doan = num
-    dung = 0  # Không tính đúng/sai thực tế nếu không có bot_predict
+    dung = 0
     sai = 0
     tile = 0
     return so_du_doan, dung, sai, tile
@@ -164,8 +171,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(df) >= MIN_BATCH:
         train_models(df_feat)
     models = load_models()
-    if models is None:
-        await update.message.reply_text("Chưa đủ dữ liệu để dự đoán. Hãy nhập thêm kết quả!")
+    if (models is None or 
+        models['tx'] is None or
+        models['cl'] is None or
+        models['bao'] is None):
+        lines = []
+        lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
+        lines.append("⚠️ Chưa đủ dữ liệu đa dạng để dự đoán (lịch sử mới chỉ có 1 loại kết quả). Nhập thêm cả Tài/Xỉu, Chẵn/Lẻ, Bão/Không bão để bot hoạt động chính xác!")
+        await update.message.reply_text('\n'.join(lines))
         return
     X_pred = df_feat.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
     tx_proba, tx_probs = predict_stacking(X_pred, models, 'tx')
@@ -210,6 +223,12 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_feat = make_features(df)
     train_models(df_feat)
     models = load_models()
+    if (models is None or 
+        models['tx'] is None or
+        models['cl'] is None or
+        models['bao'] is None):
+        await update.message.reply_text("⚠️ Chưa đủ dữ liệu đa dạng để dự đoán (lịch sử mới chỉ có 1 loại kết quả). Nhập thêm cả Tài/Xỉu, Chẵn/Lẻ, Bão/Không bão để bot hoạt động chính xác!")
+        return
     X_pred = df_feat.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
     tx_proba, _ = predict_stacking(X_pred, models, 'tx')
     cl_proba, _ = predict_stacking(X_pred, models, 'cl')
