@@ -28,15 +28,19 @@ if not BOT_TOKEN or not DATABASE_URL:
 engine = create_engine(DATABASE_URL)
 
 def create_table():
-    with engine.connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id SERIAL PRIMARY KEY,
-                input TEXT,
-                actual TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id SERIAL PRIMARY KEY,
+            input TEXT,
+            actual TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def insert_result(input_str, actual):
     now = datetime.now()
@@ -49,10 +53,8 @@ def insert_result(input_str, actual):
 def fetch_history(limit=10000):
     return pd.read_sql("SELECT input, actual, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, engine)
 
-# ==== FEATURE ENGINEERING ====
 def make_features(df):
     df = df.copy()
-    # Tổng, chẵn/lẻ, rolling % tài/xỉu/chẵn/lẻ, bão
     df['total'] = df['input'].apply(lambda x: sum([int(i) for i in x.split()]))
     df['even'] = df['total'] % 2
     df['bao'] = df['input'].apply(lambda x: 1 if len(set(x.split()))==1 else 0)
@@ -60,7 +62,6 @@ def make_features(df):
     df['xiu'] = (df['total'] <= 10).astype(int)
     df['chan'] = (df['even'] == 0).astype(int)
     df['le'] = (df['even'] == 1).astype(int)
-    # Rolling %
     df['tai_roll'] = df['tai'].rolling(ROLLING_WINDOW, min_periods=1).mean()
     df['xiu_roll'] = df['xiu'].rolling(ROLLING_WINDOW, min_periods=1).mean()
     df['chan_roll'] = df['chan'].rolling(ROLLING_WINDOW, min_periods=1).mean()
@@ -68,16 +69,13 @@ def make_features(df):
     df['bao_roll'] = df['bao'].rolling(ROLLING_WINDOW, min_periods=1).mean()
     return df
 
-# ==== TRAIN/LOAD MODEL ====
 MODEL_PATH = "ml_stack.joblib"
 
 def train_models(df):
-    # Chuẩn bị X, y cho từng nhánh
     X = df[['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
-    y_tx = (df['total'] >= 11).astype(int)  # Tài/Xỉu
-    y_cl = (df['even'] == 0).astype(int)    # Chẵn/Lẻ
+    y_tx = (df['total'] >= 11).astype(int)
+    y_cl = (df['even'] == 0).astype(int)
     y_bao = df['bao']
-    # Logistic, RF, XGB
     models = {}
     for key, y in [('tx', y_tx), ('cl', y_cl), ('bao', y_bao)]:
         lr = LogisticRegression().fit(X, y)
@@ -91,16 +89,14 @@ def load_models():
         return None
     return joblib.load(MODEL_PATH)
 
-# ==== PREDICT STACKING ====
 def predict_stacking(X_pred, models, key):
     lr, rf, xgbc = models[key]
     prob_lr = lr.predict_proba(X_pred)[0][1]
     prob_rf = rf.predict_proba(X_pred)[0][1]
     prob_xgb = xgbc.predict_proba(X_pred)[0][1]
     probs = np.array([prob_lr, prob_rf, prob_xgb])
-    return probs.mean(), probs  # trả xác suất trung bình & từng model
+    return probs.mean(), probs
 
-# ==== SUMMARY STAT ====
 def summary_stats(df):
     num = len(df)
     if num == 0:
@@ -112,7 +108,6 @@ def summary_stats(df):
     tile = round((dung / so_du_doan) * 100, 2) if so_du_doan else 0
     return so_du_doan, dung, sai, tile
 
-# ==== DAI DIEM NEN DANH ====
 def suggest_best_totals(df, prediction):
     if prediction not in ("Tài", "Xỉu") or df.empty:
         return "-"
@@ -130,27 +125,21 @@ def suggest_best_totals(df, prediction):
         return "-"
     return f"{min(best)}–{max(best)}"
 
-# ==== HANDLER ====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     create_table()
-    # Nhận kết quả: 3 số liền nhau hoặc có dấu cách
     m = re.match(r"^(\d{3})$", text)
     m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
     if not (m or m2):
         await update.message.reply_text("Vui lòng nhập kết quả theo định dạng: 456 hoặc 4 5 6.")
         return
-
     numbers = [int(x) for x in (m.group(1) if m else " ".join([m2.group(1), m2.group(2), m2.group(3)]))]
     input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
     total = sum(numbers)
     actual = "Tài" if total >= 11 else "Xỉu"
     insert_result(input_str, actual)
-
-    # Lấy lịch sử đủ data
     df = fetch_history(10000)
     df_feat = make_features(df)
-    # Train lại nếu đủ batch
     if len(df) >= MIN_BATCH:
         train_models(df_feat)
     models = load_models()
@@ -158,23 +147,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Chưa đủ dữ liệu để dự đoán. Hãy nhập thêm kết quả!")
         return
     X_pred = df_feat.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
-
-    # Dự đoán Tài/Xỉu
     tx_proba, tx_probs = predict_stacking(X_pred, models, 'tx')
     tx = "Tài" if tx_proba >= 0.5 else "Xỉu"
-    # Dự đoán Chẵn/Lẻ
     cl_proba, cl_probs = predict_stacking(X_pred, models, 'cl')
     cl = "Chẵn" if cl_proba >= 0.5 else "Lẻ"
-    # Dải điểm
     dai_diem = suggest_best_totals(df, tx)
-    # Bão
     bao_proba, bao_probs = predict_stacking(X_pred, models, 'bao')
     bao_pct = round(bao_proba*100,2)
-
-    # Tổng hợp stats
     so_du_doan, dung, sai, tile = summary_stats(df)
-
-    # Form trả lời
     lines = []
     lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
     if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
@@ -183,18 +163,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("⚠️ Dự đoán: Nên nghỉ phiên này!")
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
     lines.append(f"Xác suất ra bão: {bao_pct}%")
-    # Cảnh báo
     if max(tx_proba, 1-tx_proba) >= PROBA_ALERT:
         lines.append(f"❗️CẢNH BÁO: Xác suất {tx} vượt {int(PROBA_ALERT*100)}% – trend cực mạnh!")
     if bao_proba >= BAO_CUTOFF:
         lines.append(f"❗️CẢNH BÁO: Xác suất bão cao ({bao_pct}%) – cân nhắc vào bão!")
     lines.append(f"BOT đã dự đoán: {so_du_doan} phiên | Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%")
-    # Nhận định cuối
     if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
         lines.append(f"Nhận định: Ưu tiên {tx}, {cl}, dải {dai_diem}. Bão {bao_pct}% – {'ưu tiên' if bao_proba >= BAO_CUTOFF else 'không nên đánh'} bão.")
     else:
         lines.append("Nhận định: Không có cửa ưu thế, nên nghỉ.")
-
     await update.message.reply_text('\n'.join(lines))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
