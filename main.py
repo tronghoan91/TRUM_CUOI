@@ -1,7 +1,6 @@
 import os
 import pandas as pd
 import psycopg2
-from sqlalchemy import create_engine
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime
@@ -21,13 +20,13 @@ PROBA_CUTOFF = 0.62  # Ngưỡng xác suất ưu tiên
 PROBA_ALERT = 0.75   # Ngưỡng cảnh báo mạnh
 BAO_CUTOFF = 0.03    # Ngưỡng cảnh báo bão
 
+MODEL_PATH = "ml_stack.joblib"
+
 if not BOT_TOKEN or not DATABASE_URL:
     raise Exception("Bạn cần set BOT_TOKEN và DATABASE_URL ở biến môi trường!")
 
-# ==== DB CONNECT ====
-engine = create_engine(DATABASE_URL)
-
 def create_table():
+    # Kết nối DB và tạo bảng nếu chưa có
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute("""
@@ -43,15 +42,23 @@ def create_table():
     conn.close()
 
 def insert_result(input_str, actual):
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
     now = datetime.now()
-    with engine.connect() as conn:
-        conn.execute(
-            "INSERT INTO history (input, actual, created_at) VALUES (%s, %s, %s)",
-            (input_str, actual, now)
-        )
+    cur.execute(
+        "INSERT INTO history (input, actual, created_at) VALUES (%s, %s, %s);",
+        (input_str, actual, now)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def fetch_history(limit=10000):
-    return pd.read_sql("SELECT input, actual, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, engine)
+    # Dùng pandas và psycopg2, không dùng SQLAlchemy
+    conn = psycopg2.connect(DATABASE_URL)
+    df = pd.read_sql("SELECT input, actual, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, conn)
+    conn.close()
+    return df
 
 def make_features(df):
     df = df.copy()
@@ -68,8 +75,6 @@ def make_features(df):
     df['le_roll'] = df['le'].rolling(ROLLING_WINDOW, min_periods=1).mean()
     df['bao_roll'] = df['bao'].rolling(ROLLING_WINDOW, min_periods=1).mean()
     return df
-
-MODEL_PATH = "ml_stack.joblib"
 
 def train_models(df):
     X = df[['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
@@ -101,11 +106,10 @@ def summary_stats(df):
     num = len(df)
     if num == 0:
         return 0, 0, 0, 0
-    df_pred = df[df['bot_predict'].notnull()] if 'bot_predict' in df else df
-    so_du_doan = len(df_pred)
-    dung = ((df_pred['bot_predict'] == df_pred['actual'])).sum() if 'bot_predict' in df_pred else 0
-    sai = so_du_doan - dung
-    tile = round((dung / so_du_doan) * 100, 2) if so_du_doan else 0
+    so_du_doan = num
+    dung = 0  # Không tính đúng/sai thực tế nếu không có bot_predict
+    sai = 0
+    tile = 0
     return so_du_doan, dung, sai, tile
 
 def suggest_best_totals(df, prediction):
