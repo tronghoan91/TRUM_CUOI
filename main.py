@@ -1,279 +1,249 @@
 import os
-import logging
 import pandas as pd
 import psycopg2
-from collections import Counter
-from flask import Flask
-import threading
+from sqlalchemy import create_engine
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime
 import re
+import joblib
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
+import numpy as np
 
-def start_flask():
-    app = Flask(__name__)
-    @app.route('/')
-    def home():
-        return "Sicbo Bot is alive!", 200
-    @app.route('/healthz')
-    def health():
-        return "OK", 200
-    app.run(host='0.0.0.0', port=10000)
-threading.Thread(target=start_flask, daemon=True).start()
-
+# ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not BOT_TOKEN or not DATABASE_URL:
-    raise Exception("Bạn cần set cả BOT_TOKEN và DATABASE_URL ở biến môi trường!")
-logging.basicConfig(level=logging.INFO)
+MIN_BATCH = 5        # Số kết quả mới tối thiểu để train lại model
+ROLLING_WINDOW = 50  # Window tính rolling xác suất
+PROBA_CUTOFF = 0.62  # Ngưỡng xác suất ưu tiên
+PROBA_ALERT = 0.75   # Ngưỡng cảnh báo mạnh
+BAO_CUTOFF = 0.03    # Ngưỡng cảnh báo bão
 
-def get_db_conn():
-    return psycopg2.connect(DATABASE_URL)
+if not BOT_TOKEN or not DATABASE_URL:
+    raise Exception("Bạn cần set BOT_TOKEN và DATABASE_URL ở biến môi trường!")
+
+# ==== DB CONNECT ====
+engine = create_engine(DATABASE_URL)
 
 def create_table():
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS history (
-                    id SERIAL PRIMARY KEY,
-                    input TEXT,
-                    actual TEXT,
-                    bot_predict TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            conn.commit()
+    with engine.connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id SERIAL PRIMARY KEY,
+                input TEXT,
+                actual TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-def alter_table_add_column_bot_predict():
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("ALTER TABLE history ADD COLUMN IF NOT EXISTS bot_predict TEXT;")
-            conn.commit()
+def insert_result(input_str, actual):
+    now = datetime.now()
+    with engine.connect() as conn:
+        conn.execute(
+            "INSERT INTO history (input, actual, created_at) VALUES (%s, %s, %s)",
+            (input_str, actual, now)
+        )
 
-def fetch_history_all(limit=10000):
-    with get_db_conn() as conn:
-        query = """
-        SELECT id, input, actual, bot_predict, created_at 
-        FROM history 
-        ORDER BY id ASC LIMIT %s
-        """
-        df = pd.read_sql(query, conn, params=(limit,))
+def fetch_history(limit=10000):
+    return pd.read_sql("SELECT input, actual, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, engine)
+
+# ==== FEATURE ENGINEERING ====
+def make_features(df):
+    df = df.copy()
+    # Tổng, chẵn/lẻ, rolling % tài/xỉu/chẵn/lẻ, bão
+    df['total'] = df['input'].apply(lambda x: sum([int(i) for i in x.split()]))
+    df['even'] = df['total'] % 2
+    df['bao'] = df['input'].apply(lambda x: 1 if len(set(x.split()))==1 else 0)
+    df['tai'] = (df['total'] >= 11).astype(int)
+    df['xiu'] = (df['total'] <= 10).astype(int)
+    df['chan'] = (df['even'] == 0).astype(int)
+    df['le'] = (df['even'] == 1).astype(int)
+    # Rolling %
+    df['tai_roll'] = df['tai'].rolling(ROLLING_WINDOW, min_periods=1).mean()
+    df['xiu_roll'] = df['xiu'].rolling(ROLLING_WINDOW, min_periods=1).mean()
+    df['chan_roll'] = df['chan'].rolling(ROLLING_WINDOW, min_periods=1).mean()
+    df['le_roll'] = df['le'].rolling(ROLLING_WINDOW, min_periods=1).mean()
+    df['bao_roll'] = df['bao'].rolling(ROLLING_WINDOW, min_periods=1).mean()
     return df
 
-def get_history_count():
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM history")
-            return cur.fetchone()[0]
+# ==== TRAIN/LOAD MODEL ====
+MODEL_PATH = "ml_stack.joblib"
 
-def insert_prediction_only(prediction):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO history (input, bot_predict, created_at) VALUES (%s, %s, %s)",
-                ('', prediction, datetime.now())
-            )
-            conn.commit()
+def train_models(df):
+    # Chuẩn bị X, y cho từng nhánh
+    X = df[['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+    y_tx = (df['total'] >= 11).astype(int)  # Tài/Xỉu
+    y_cl = (df['even'] == 0).astype(int)    # Chẵn/Lẻ
+    y_bao = df['bao']
+    # Logistic, RF, XGB
+    models = {}
+    for key, y in [('tx', y_tx), ('cl', y_cl), ('bao', y_bao)]:
+        lr = LogisticRegression().fit(X, y)
+        rf = RandomForestClassifier(n_estimators=100).fit(X, y)
+        xgbc = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss').fit(X, y)
+        models[key] = (lr, rf, xgbc)
+    joblib.dump(models, MODEL_PATH)
 
-def update_last_prediction_with_result(input_str, actual):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE history
-                SET input = %s, actual = %s
-                WHERE id = (
-                    SELECT id FROM history
-                    WHERE actual IS NULL
-                    ORDER BY id DESC
-                    LIMIT 1
-                )
-            """, (input_str, actual))
-            conn.commit()
+def load_models():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    return joblib.load(MODEL_PATH)
 
-def analyze_trend_and_predict(df_with_actual):
-    note = ""
-    prediction = None
-    if len(df_with_actual) >= 8:
-        actuals = df_with_actual['actual'].tolist()
-        streak = 1
-        last = actuals[-1]
-        for v in reversed(actuals[:-1]):
-            if v == last:
-                streak += 1
-            else:
-                break
-        flip_count = sum([actuals[i]!=actuals[i-1] for i in range(1, len(actuals))])
-        flip_rate = flip_count/(len(actuals)-1) if len(actuals)>1 else 0
-        acc = sum(df_with_actual['bot_predict']==df_with_actual['actual'])/len(df_with_actual) if 'bot_predict' in df_with_actual else 0
+# ==== PREDICT STACKING ====
+def predict_stacking(X_pred, models, key):
+    lr, rf, xgbc = models[key]
+    prob_lr = lr.predict_proba(X_pred)[0][1]
+    prob_rf = rf.predict_proba(X_pred)[0][1]
+    prob_xgb = xgbc.predict_proba(X_pred)[0][1]
+    probs = np.array([prob_lr, prob_rf, prob_xgb])
+    return probs.mean(), probs  # trả xác suất trung bình & từng model
 
-        if streak >= 5:
-            note = f"⚠️ Trend {last.upper()} đã kéo dài {streak} phiên – NGUY CƠ ĐẢO CẦU RẤT CAO, nên vào nhẹ đảo cầu hoặc tránh phiên này."
-            prediction = "Xỉu" if last == "Tài" else "Tài"
-        elif acc < 0.43 and flip_rate > 0.88:
-            note = "⚠️ Cầu cực nhiễu, tỉ lệ đúng thấp, nên nghỉ hoặc vào cực nhẹ để dò sóng."
-            prediction = None
-        elif streak >= 3:
-            note = f"🔥 Trend rõ: {last.upper()} {streak} phiên liên tiếp! Có thể vào mạnh theo trend này."
-            prediction = last
-        elif acc >= 0.48 and flip_rate < 0.87:
-            note = "💡 Cầu bình thường, có thể vào nhẹ thăm dò theo xác suất gần đây."
-            prediction = "Tài" if df_with_actual['actual'].value_counts().get("Tài", 0) >= df_with_actual['actual'].value_counts().get("Xỉu", 0) else "Xỉu"
-        else:
-            note = "Không có trend rõ, có thể vào nhẹ theo xác suất gốc."
-            prediction = "Tài"
-    else:
-        note = "Chưa đủ dữ liệu thực tế, vào nhẹ theo xác suất gốc."
-        prediction = "Tài"
-    return prediction, note
+# ==== SUMMARY STAT ====
+def summary_stats(df):
+    num = len(df)
+    if num == 0:
+        return 0, 0, 0, 0
+    df_pred = df[df['bot_predict'].notnull()] if 'bot_predict' in df else df
+    so_du_doan = len(df_pred)
+    dung = ((df_pred['bot_predict'] == df_pred['actual'])).sum() if 'bot_predict' in df_pred else 0
+    sai = so_du_doan - dung
+    tile = round((dung / so_du_doan) * 100, 2) if so_du_doan else 0
+    return so_du_doan, dung, sai, tile
 
-def suggest_best_totals_by_prediction(df_with_actual, prediction, n_last=40, min_ratio=0.5):
-    if prediction not in ("Tài", "Xỉu") or df_with_actual.empty:
-        return [], "Không có dự đoán, không nên đánh dải tổng."
-    recent = df_with_actual.tail(n_last)
+# ==== DAI DIEM NEN DANH ====
+def suggest_best_totals(df, prediction):
+    if prediction not in ("Tài", "Xỉu") or df.empty:
+        return "-"
+    recent = df.tail(ROLLING_WINDOW)
     totals = [sum(int(x) for x in s.split()) for s in recent['input'] if s]
     if prediction == "Tài":
         eligible = [t for t in range(11, 19)]
     else:
         eligible = [t for t in range(3, 11)]
-    total_counts = Counter([t for t in totals if t in eligible])
-    if not total_counts:
-        return [], "Cầu tổng quá nhiễu, không nên đánh tổng phiên này."
-    sorted_totals = [t for t, _ in total_counts.most_common()]
-    cumulative, dsum, best = 0, sum(total_counts.values()), []
-    for t in sorted_totals:
-        cumulative += total_counts[t]
-        best.append(t)
-        if dsum and cumulative / dsum >= min_ratio:
-            break
-    if len(best) < 2:
-        return [], "⚠️ Cầu tổng đang out trend, không nên đánh tổng phiên này."
-    return sorted(best), ""
+    count = pd.Series([t for t in totals if t in eligible]).value_counts()
+    if count.empty:
+        return "-"
+    best = count.index[:3].tolist()
+    if not best:
+        return "-"
+    return f"{min(best)}–{max(best)}"
 
-def reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note):
-    tong = len(df_all)
-    tong_da_nhap_ket_qua = len(df_with_actual)
-
-    df_stat = df_with_actual[df_with_actual['bot_predict'].notnull()]
-    so_du_doan = len(df_stat)
-    dung = sum(df_stat['bot_predict'] == df_stat['actual'])
-    sai = so_du_doan - dung
-    tile = round((dung / so_du_doan) * 100, 2) if so_du_doan else 0
-
-    msg = (
-        f"📊 Tổng phiên đã lưu: {tong} | Đã có kết quả: {tong_da_nhap_ket_qua}\n"
-        f"🤖 Bot đã dự đoán: {so_du_doan} phiên\n"
-        f"✅ Đúng: {dung} | ❌ Sai: {sai} | 🎯 Tỉ lệ đúng: {tile}%\n\n"
-        f"📌 Dự đoán phiên kế tiếp: {prediction or '-'}\n"
-        f"🎯 Dải tổng nên đánh: {', '.join(str(x) for x in best_totals) if best_totals else '-'}\n"
-        f"{total_note}\n"
-        f"{trend_note}"
-    )
-    return msg
-
-reset_confirm = {}
-
+# ==== HANDLER ====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     create_table()
-    alter_table_add_column_bot_predict()
+    # Nhận kết quả: 3 số liền nhau hoặc có dấu cách
     m = re.match(r"^(\d{3})$", text)
     m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
-    if m or m2:
-        if m:
-            numbers = [int(x) for x in m.group(1)]
-        else:
-            numbers = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
-        input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
-        total = sum(numbers)
-        actual = "Tài" if total >= 11 else "Xỉu"
-
-        update_last_prediction_with_result(input_str, actual)
-
-        df_all = fetch_history_all(10000)
-        df_with_actual = df_all[df_all['actual'].notnull()]
-        prediction, trend_note = analyze_trend_and_predict(df_with_actual)
-        insert_prediction_only(prediction)
-        df_all = fetch_history_all(10000)
-        df_with_actual = df_all[df_all['actual'].notnull()]
-        best_totals, total_note = suggest_best_totals_by_prediction(df_with_actual, prediction)
-
-        msg = (
-            f"✔️ Kết quả thực tế phiên vừa nhập: {actual} (tổng: {total})\n"
-            + reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note)
-        )
-        await update.message.reply_text(msg)
+    if not (m or m2):
+        await update.message.reply_text("Vui lòng nhập kết quả theo định dạng: 456 hoặc 4 5 6.")
         return
 
-    await update.message.reply_text(
-        "Vui lòng nhập dãy 3 số kết quả thực tế (ví dụ: 4 5 6 hoặc 456)."
-    )
+    numbers = [int(x) for x in (m.group(1) if m else " ".join([m2.group(1), m2.group(2), m2.group(3)]))]
+    input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
+    total = sum(numbers)
+    actual = "Tài" if total >= 11 else "Xỉu"
+    insert_result(input_str, actual)
+
+    # Lấy lịch sử đủ data
+    df = fetch_history(10000)
+    df_feat = make_features(df)
+    # Train lại nếu đủ batch
+    if len(df) >= MIN_BATCH:
+        train_models(df_feat)
+    models = load_models()
+    if models is None:
+        await update.message.reply_text("Chưa đủ dữ liệu để dự đoán. Hãy nhập thêm kết quả!")
+        return
+    X_pred = df_feat.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+
+    # Dự đoán Tài/Xỉu
+    tx_proba, tx_probs = predict_stacking(X_pred, models, 'tx')
+    tx = "Tài" if tx_proba >= 0.5 else "Xỉu"
+    # Dự đoán Chẵn/Lẻ
+    cl_proba, cl_probs = predict_stacking(X_pred, models, 'cl')
+    cl = "Chẵn" if cl_proba >= 0.5 else "Lẻ"
+    # Dải điểm
+    dai_diem = suggest_best_totals(df, tx)
+    # Bão
+    bao_proba, bao_probs = predict_stacking(X_pred, models, 'bao')
+    bao_pct = round(bao_proba*100,2)
+
+    # Tổng hợp stats
+    so_du_doan, dung, sai, tile = summary_stats(df)
+
+    # Form trả lời
+    lines = []
+    lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
+    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
+        lines.append(f"🎯 Dự đoán: {tx} | {cl}")
+    else:
+        lines.append("⚠️ Dự đoán: Nên nghỉ phiên này!")
+    lines.append(f"Dải điểm nên đánh: {dai_diem}")
+    lines.append(f"Xác suất ra bão: {bao_pct}%")
+    # Cảnh báo
+    if max(tx_proba, 1-tx_proba) >= PROBA_ALERT:
+        lines.append(f"❗️CẢNH BÁO: Xác suất {tx} vượt {int(PROBA_ALERT*100)}% – trend cực mạnh!")
+    if bao_proba >= BAO_CUTOFF:
+        lines.append(f"❗️CẢNH BÁO: Xác suất bão cao ({bao_pct}%) – cân nhắc vào bão!")
+    lines.append(f"BOT đã dự đoán: {so_du_doan} phiên | Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%")
+    # Nhận định cuối
+    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
+        lines.append(f"Nhận định: Ưu tiên {tx}, {cl}, dải {dai_diem}. Bão {bao_pct}% – {'ưu tiên' if bao_proba >= BAO_CUTOFF else 'không nên đánh'} bão.")
+    else:
+        lines.append("Nhận định: Không có cửa ưu thế, nên nghỉ.")
+
+    await update.message.reply_text('\n'.join(lines))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Xin chào! Đây là Sicbo RealBot.\n"
-        "Các lệnh bạn có thể dùng:\n"
-        "/start - Xem giới thiệu và lệnh\n"
-        "/stats - Xem thống kê dữ liệu, trend, chuỗi thắng/thua\n"
-        "/count - Đếm tổng số phiên đã nhập\n"
-        "/reset - Reset toàn bộ lịch sử (Cẩn thận, không thể khôi phục)\n"
-        "/backup - Xuất file lịch sử ra CSV\n"
-        "Gửi 3 số kết quả (ví dụ: 3 5 6 hoặc 356), bot sẽ tự tính toán, thống kê, phân tích trend và dự đoán siêu linh động!"
+        "Đây là Sicbo ML Bot.\n"
+        "- Nhập 3 số kết quả (vd: 456 hoặc 4 5 6) để lưu và cập nhật model.\n"
+        "- Gõ /predict để nhận dự đoán phiên tiếp theo."
     )
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    create_table()
-    alter_table_add_column_bot_predict()
-    df_all = fetch_history_all(10000)
-    df_with_actual = df_all[df_all['actual'].notnull()]
-    prediction, trend_note = analyze_trend_and_predict(df_with_actual)
-    best_totals, total_note = suggest_best_totals_by_prediction(df_with_actual, prediction)
-    msg = reply_summary(df_all, df_with_actual, best_totals, prediction, trend_note, total_note)
-    await update.message.reply_text(msg)
-
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    create_table()
-    alter_table_add_column_bot_predict()
-    df = fetch_history_all(10000)
-    if df.empty:
-        await update.message.reply_text("Không có dữ liệu để backup.")
+async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df = fetch_history(10000)
+    if len(df) < MIN_BATCH:
+        await update.message.reply_text("Chưa đủ dữ liệu để dự đoán. Hãy nhập thêm kết quả!")
         return
-    now_str = pd.Timestamp.now().strftime("%Y-%m-%d_%H-%M")
-    path = f"/tmp/sicbo_history_backup_{now_str}.csv"
-    df.to_csv(path, index=False)
-    await update.message.reply_document(document=open(path, "rb"), filename=f"sicbo_history_backup_{now_str}.csv")
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if reset_confirm.get(user_id):
-        create_table()
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM history")
-                conn.commit()
-        reset_confirm[user_id] = False
-        await update.message.reply_text("Đã reset toàn bộ lịch sử!")
+    df_feat = make_features(df)
+    train_models(df_feat)
+    models = load_models()
+    X_pred = df_feat.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+    tx_proba, _ = predict_stacking(X_pred, models, 'tx')
+    cl_proba, _ = predict_stacking(X_pred, models, 'cl')
+    tx = "Tài" if tx_proba >= 0.5 else "Xỉu"
+    cl = "Chẵn" if cl_proba >= 0.5 else "Lẻ"
+    dai_diem = suggest_best_totals(df, tx)
+    bao_proba, _ = predict_stacking(X_pred, models, 'bao')
+    bao_pct = round(bao_proba*100,2)
+    so_du_doan, dung, sai, tile = summary_stats(df)
+    lines = []
+    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
+        lines.append(f"🎯 Dự đoán: {tx} | {cl}")
     else:
-        reset_confirm[user_id] = True
-        await update.message.reply_text(
-            "Bạn có chắc chắn muốn xóa toàn bộ lịch sử không?\n"
-            "Gõ lại /reset lần nữa để xác nhận."
-        )
-
-async def count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    create_table()
-    alter_table_add_column_bot_predict()
-    count = get_history_count()
-    await update.message.reply_text(f"Đã có tổng cộng {count} phiên dữ liệu được lưu.")
+        lines.append("⚠️ Dự đoán: Nên nghỉ phiên này!")
+    lines.append(f"Dải điểm nên đánh: {dai_diem}")
+    lines.append(f"Xác suất ra bão: {bao_pct}%")
+    if max(tx_proba, 1-tx_proba) >= PROBA_ALERT:
+        lines.append(f"❗️CẢNH BÁO: Xác suất {tx} vượt {int(PROBA_ALERT*100)}% – trend cực mạnh!")
+    if bao_proba >= BAO_CUTOFF:
+        lines.append(f"❗️CẢNH BÁO: Xác suất bão cao ({bao_pct}%) – cân nhắc vào bão!")
+    lines.append(f"BOT đã dự đoán: {so_du_doan} phiên | Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%")
+    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
+        lines.append(f"Nhận định: Ưu tiên {tx}, {cl}, dải {dai_diem}. Bão {bao_pct}% – {'ưu tiên' if bao_proba >= BAO_CUTOFF else 'không nên đánh'} bão.")
+    else:
+        lines.append("Nhận định: Không có cửa ưu thế, nên nghỉ.")
+    await update.message.reply_text('\n'.join(lines))
 
 def main():
     create_table()
-    alter_table_add_column_bot_predict()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("count", count))
+    app.add_handler(CommandHandler("predict", predict))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
